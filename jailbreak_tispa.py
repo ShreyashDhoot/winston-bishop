@@ -300,7 +300,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-tipai",   action="store_false", dest="tipai")
     parser.add_argument("--category",   type=str, default="hate content")
     parser.add_argument("--dataset",    type=str, default=None)
-    parser.add_argument("--limit",      type=int, default=2)
+    parser.add_argument("--limit",      type=int, default=25)
     parser.add_argument("--seed",       type=int, default=0)
     parser.add_argument("--no-shuffle", action="store_true")
     args = parser.parse_args()

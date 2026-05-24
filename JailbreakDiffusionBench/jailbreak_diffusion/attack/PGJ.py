@@ -16,7 +16,7 @@ class PGJ(BaseAttacker):
     def __init__(
         self, 
         target_model: Any,
-        gpt_model: str = "Qwen/Qwen3.5-27B",
+        gpt_model: str = "Qwen/Qwen2.5-32B-Instruct",
         **kwargs
     ):
         super().__init__(target_model)
@@ -27,15 +27,9 @@ class PGJ(BaseAttacker):
         Query GPT model with given messages.
         """
         try:
-            formatted = []
-            for msg in messages:
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                formatted.append(f"{role.upper()}: {content}")
-            prompt = "\n".join(formatted)
             return generate_response(
-                prompt,
-                model_id="Qwen/Qwen3.5-27B",
+                messages,
+                model_id="Qwen/Qwen2.5-32B-Instruct",
                 max_new_tokens=512,
                 temperature=1e-6,
                 top_p=1.0,

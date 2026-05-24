@@ -101,42 +101,27 @@ def _unet_step(pipe, latents: torch.Tensor, t, text_emb, cfg_scale: float) -> to
     """
     is_xl = hasattr(pipe, "text_encoder_2")
 
-    # Freeze UNet weights for this forward pass so PyTorch does NOT build a
-    # gradient graph through the 5B+ UNet parameters.  The null-text optimiser
-    # only needs gradients w.r.t. null_seq / null_pool (tiny embedding tensors);
-    # propagating through the full UNet wastes 20-30 GB of activation memory.
-    # We temporarily disable grad on all UNet params, run the forward, then
-    # restore the original requires_grad state so training is unaffected.
-    unet_params = list(pipe.unet.parameters())
-    saved_grad  = [p.requires_grad for p in unet_params]
-    for p in unet_params:
-        p.requires_grad_(False)
-
-    try:
-        if is_xl:
-            pe   = text_emb["prompt_embeds"]
-            npe  = text_emb["negative_prompt_embeds"]
-            ppe  = text_emb["pooled_prompt_embeds"]
-            npp  = text_emb["negative_pooled_prompt_embeds"]
-            H    = latents.shape[2] * 8
-            W    = latents.shape[3] * 8
-            time_ids = torch.tensor(
-                [[H, W, 0, 0, H, W]], device=latents.device, dtype=pe.dtype
-            )
-            add_cond = {"text_embeds": ppe, "time_ids": time_ids}
-            add_unc  = {"text_embeds": npp, "time_ids": time_ids}
-            li   = torch.cat([latents] * 2)
-            li   = pipe.scheduler.scale_model_input(li, t)
-            enc  = torch.cat([npe, pe])
-            add  = {k: torch.cat([u, c]) for (k, u), (_, c) in zip(add_unc.items(), add_cond.items())}
-            np_  = pipe.unet(li, t, encoder_hidden_states=enc, added_cond_kwargs=add).sample
-        else:
-            li   = torch.cat([latents] * 2)
-            li   = pipe.scheduler.scale_model_input(li, t)
-            np_  = pipe.unet(li, t, encoder_hidden_states=text_emb).sample
-    finally:
-        for p, grad in zip(unet_params, saved_grad):
-            p.requires_grad_(grad)
+    if is_xl:
+        pe   = text_emb["prompt_embeds"]
+        npe  = text_emb["negative_prompt_embeds"]
+        ppe  = text_emb["pooled_prompt_embeds"]
+        npp  = text_emb["negative_pooled_prompt_embeds"]
+        H    = latents.shape[2] * 8
+        W    = latents.shape[3] * 8
+        time_ids = torch.tensor(
+            [[H, W, 0, 0, H, W]], device=latents.device, dtype=pe.dtype
+        )
+        add_cond = {"text_embeds": ppe, "time_ids": time_ids}
+        add_unc  = {"text_embeds": npp, "time_ids": time_ids}
+        li   = torch.cat([latents] * 2)
+        li   = pipe.scheduler.scale_model_input(li, t)
+        enc  = torch.cat([npe, pe])
+        add  = {k: torch.cat([u, c]) for (k, u), (_, c) in zip(add_unc.items(), add_cond.items())}
+        np_  = pipe.unet(li, t, encoder_hidden_states=enc, added_cond_kwargs=add).sample
+    else:
+        li   = torch.cat([latents] * 2)
+        li   = pipe.scheduler.scale_model_input(li, t)
+        np_  = pipe.unet(li, t, encoder_hidden_states=text_emb).sample
 
     u_n, c_n = np_.chunk(2)
     return u_n + cfg_scale * (c_n - u_n)

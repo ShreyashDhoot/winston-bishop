@@ -1,4 +1,3 @@
-
 import random
 import os
 from http import HTTPStatus
@@ -374,7 +373,7 @@ class DACA(BaseAttacker):
         try:
             return generate_response(
                 prompt,
-                model_id="Qwen/Qwen3.5-27B",
+                model_id="Qwen/Qwen2.5-32B-Instruct",
                 max_new_tokens=512,
                 temperature=1e-6,
                 top_p=1.0,
@@ -546,7 +545,7 @@ class DACA(BaseAttacker):
             execution_time=end_time - start_time,
             is_text_NSFW=is_text_NSFW,
             is_image_NSFW=is_image_NSFW,
-            generated_image=generation_output.images,
+            generated_image=None,
             method='DACA',
             metadata={
                 'num_queries': result['num_query'],

@@ -11,6 +11,14 @@ except Exception:  # pragma: no cover - optional dependency in older versions
     AutoProcessor = None
 
 
+import re
+
+def _strip_thinking(text: str) -> str:
+    """Remove Qwen3.5 <think>...</think> blocks and return clean output."""
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    return text.strip()
+
+
 _DEFAULT_MODEL_ID = os.getenv("QWEN_MODEL_ID", "Qwen/Qwen3.5-27B")
 _DEFAULT_CACHE_DIR = os.getenv("QWEN_CACHE_DIR")
 _DEFAULT_TORCH_DTYPE = torch.bfloat16
@@ -210,9 +218,9 @@ def generate_response(
 
         if input_ids is None:
             decoded = bundle.tokenizer.decode(output_ids[0], skip_special_tokens=True)
-            return decoded.strip()
+            return _strip_thinking(decoded)
 
         prompt_length = input_ids.shape[-1]
         generated_ids = output_ids[0][prompt_length:]
         decoded = bundle.tokenizer.decode(generated_ids, skip_special_tokens=True)
-        return decoded.strip()
+        return _strip_thinking(decoded)

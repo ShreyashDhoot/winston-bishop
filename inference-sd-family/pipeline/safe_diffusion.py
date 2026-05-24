@@ -92,6 +92,11 @@ def _load_sd1x(model_id, dtype, plan: DevicePlan, token=None):
     ).to(plan.base_device)
     pipe.scheduler     = DDIMScheduler.from_config(pipe.scheduler.config)
     pipe.safety_checker = None
+    # Explicitly move each submodule — see _load_sdxl comment for rationale.
+    for attr in ("text_encoder", "unet", "vae"):
+        submod = getattr(pipe, attr, None)
+        if submod is not None:
+            submod.to(plan.base_device)
     return pipe
 
 
@@ -105,6 +110,14 @@ def _load_sdxl(model_id, dtype, plan: DevicePlan, token=None):
         pipe.safety_checker = None
     if hasattr(pipe, "requires_safety_checker"):
         pipe.requires_safety_checker = False
+    # Explicitly move each submodule to ensure they all land on plan.base_device.
+    # diffusers' pipeline .to() is not always atomic — text encoders can silently
+    # remain on cuda:0 (their from_pretrained default) if CUDA memory is tight or
+    # if the diffusers version has ordering issues, causing device mismatches later.
+    for attr in ("text_encoder", "text_encoder_2", "unet", "vae"):
+        submod = getattr(pipe, attr, None)
+        if submod is not None:
+            submod.to(plan.base_device)
     return pipe
 
 
@@ -211,15 +224,25 @@ def _encode_prompt_for_pipe(pipe, prompt, plan: DevicePlan, family, dtype):
     for use in the transformer denoising loop.
     """
     if family == "sd1x":
-        # encode_prompt now resolves the encoder's actual device internally,
-        # so the returned tensor may be on encoder_device (which equals
-        # plan.base_device in normal cases, but may differ after a model swap
-        # or if diffusers placed the text_encoder on a different GPU during
-        # from_pretrained).  Always move to plan.base_device so the UNet
-        # receives the embedding on the correct device.
+        # Force text_encoder to plan.base_device in case it drifted (e.g. MMA
+        # grabbed a reference to it and something else moved it, or diffusers
+        # .to() didn't fully propagate).
+        enc = getattr(pipe, "text_encoder", None)
+        if enc is not None and next(enc.parameters()).device != plan.base_device:
+            enc.to(plan.base_device)
         return encode_prompt(pipe, prompt, plan.base_device).to(plan.base_device, dtype=dtype)
 
     if family == "sdxl":
+        # SDXL has two text encoders (text_encoder = CLIPTextModel,
+        # text_encoder_2 = CLIPTextModelWithProjection). diffusers' encode_prompt
+        # passes a single `device` arg and does text_input_ids.to(device) for both,
+        # but the two encoders may actually be on different devices if .to() did not
+        # fully propagate (e.g. text_encoder_2 loaded separately, landed on cuda:0).
+        # Fix: force both encoders onto plan.base_device NOW, then encode.
+        for attr in ("text_encoder", "text_encoder_2"):
+            enc = getattr(pipe, attr, None)
+            if enc is not None and next(enc.parameters()).device != plan.base_device:
+                enc.to(plan.base_device)
         pe, npe, ppe, npp = pipe.encode_prompt(
             prompt=prompt, prompt_2=prompt, device=plan.base_device,
             num_images_per_prompt=1, do_classifier_free_guidance=True,
@@ -233,15 +256,14 @@ def _encode_prompt_for_pipe(pipe, prompt, plan: DevicePlan, family, dtype):
         }
 
     if family == "sd3x":
-        # Text encoders live on sd3_vae_device — encode there, move to base_device
+        # SD3x: text encoders live on sd3_vae_device (explicitly placed there by loader).
         pe, npe, ppe, npp = pipe.encode_prompt(
             prompt=prompt, prompt_2=prompt, prompt_3=prompt,
             negative_prompt="", negative_prompt_2="", negative_prompt_3="",
-            device=plan.sd3_vae_device,        # ← encoder device
+            device=plan.sd3_vae_device,
             num_images_per_prompt=1, do_classifier_free_guidance=True,
         )
         return {
-            # Move to transformer device for the denoising loop
             "prompt_embeds":                pe.to(plan.base_device, dtype=dtype),
             "negative_prompt_embeds":       npe.to(plan.base_device, dtype=dtype),
             "pooled_prompt_embeds":         ppe.to(plan.base_device, dtype=dtype),
@@ -785,6 +807,10 @@ class SafeDiffusionPipeline:
             out_path = os.path.join(cfg.get("results_dir", "results"), f"{slug}_safe.png")
             final_pil.save(out_path)
             metrics["saved_to"] = out_path
+
+        # Release fragmented CUDA allocations from reinsertion backward passes
+        # so successive prompts don't accumulate residual memory on the GPU.
+        torch.cuda.empty_cache()
 
         return GenerationResult(
             image         = final_pil,
