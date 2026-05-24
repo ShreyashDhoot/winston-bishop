@@ -324,9 +324,15 @@ def reinsert_sd3_null_text(
                 return_tensors="pt",
             )
             with torch.no_grad():
+                # Use the text_encoder's actual device for input_ids — it may
+                # differ from base_latents.device after a model swap (e.g. the
+                # sd3x text_encoder stays on cuda:0 while latents are on cuda:2).
+                # Move the resulting embedding back to `device` (base_latents.device)
+                # so the null-text optimisation loop runs on the correct device.
+                encoder_device = next(pipe.text_encoder.parameters()).device
                 null_emb = pipe.text_encoder(
-                    uncond_toks.input_ids.to(device)
-                )[0].clone().float()
+                    uncond_toks.input_ids.to(encoder_device)
+                )[0].to(device).clone().float()
             null_seq  = nn.Parameter(null_emb)
             null_pool = None
             opt = torch.optim.AdamW([null_seq], lr=cfg.get("null_lr", 0.01))

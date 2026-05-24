@@ -211,7 +211,13 @@ def _encode_prompt_for_pipe(pipe, prompt, plan: DevicePlan, family, dtype):
     for use in the transformer denoising loop.
     """
     if family == "sd1x":
-        return encode_prompt(pipe, prompt, plan.base_device).to(dtype=dtype)
+        # encode_prompt now resolves the encoder's actual device internally,
+        # so the returned tensor may be on encoder_device (which equals
+        # plan.base_device in normal cases, but may differ after a model swap
+        # or if diffusers placed the text_encoder on a different GPU during
+        # from_pretrained).  Always move to plan.base_device so the UNet
+        # receives the embedding on the correct device.
+        return encode_prompt(pipe, prompt, plan.base_device).to(plan.base_device, dtype=dtype)
 
     if family == "sdxl":
         pe, npe, ppe, npp = pipe.encode_prompt(

@@ -41,17 +41,17 @@ base_sd_model: "stabilityai/stable-diffusion-3.5-large-turbo"
 inpainter_model: "runwayml/stable-diffusion-inpainting"
 
 # LoRA weights for the inpainter (null = skip LoRA)
-inpainter_lora_path: "weights/adapter_model.safetensors"
+inpainter_lora_path: "inference-sd-family/weights/adapter_model.safetensors"
 inpainter_lora_scale: 1
 
 # ── Auditor ───────────────────────────────────────────────────────────────────
-auditor_weights: "complete_auditor_best.pth"
-auditor_vocab:   "vocab.json"
+auditor_weights: "inference-sd-family/weights/complete_auditor_best.pth"
+auditor_vocab:   "inference-sd-family/weights/vocab.json"
 
 # ── TSPO policy ───────────────────────────────────────────────────────────────
 use_tspo: true
-tspo_checkpoint:    "weights/tspo_step00800.pth"
-encoder_checkpoint: "weights/state_enc_step00800.pth"
+tspo_checkpoint:    "inference-sd-family/weights/tspo_step00800.pth"
+encoder_checkpoint: "inference-sd-family/weights/state_enc_step00800.pth"
 
 # ── Reinsertion method ────────────────────────────────────────────────────────
 # SD0_DDPM      — DDPM noise schedule blend (SD1x/SDXL only; WRONG for SD3.5)

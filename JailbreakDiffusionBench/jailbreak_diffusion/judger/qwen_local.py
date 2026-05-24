@@ -1,6 +1,6 @@
 import os
 import threading
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Union
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -70,11 +70,40 @@ def _load_bundle(model_id: str) -> _ModelBundle:
     return bundle
 
 
-def _format_prompt(tokenizer, prompt: str) -> str:
-    if hasattr(tokenizer, "apply_chat_template"):
+def _format_prompt(
+    tokenizer,
+    prompt: Union[str, List[Dict[str, str]]],
+    enable_thinking: bool = False,
+) -> str:
+    """
+    Format a prompt for the Qwen tokenizer.
+
+    Accepts either:
+      - a plain string  → wrapped in a single user turn
+      - a list of {"role": ..., "content": ...} dicts → passed directly to
+        apply_chat_template so multi-turn conversations are handled correctly
+    """
+    if isinstance(prompt, list):
+        messages = prompt
+    else:
         messages = [{"role": "user", "content": prompt}]
-        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    return prompt
+
+    if hasattr(tokenizer, "apply_chat_template"):
+        try:
+            # Disable thinking so the model emits the answer directly.
+            # Qwen3.5 thinks by default; the <think>...</think> preamble can consume
+            # hundreds of tokens before the actual label, breaking short max_new_tokens budgets.
+            return tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                chat_template_kwargs={"enable_thinking": enable_thinking},
+            )
+        except TypeError:
+            # Older tokenizers / non-Qwen models don't accept chat_template_kwargs
+            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    # Fallback for tokenizers without chat template support
+    return "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
 
 
 def _move_to_device(inputs: Dict[str, Any], model) -> Dict[str, Any]:
@@ -114,17 +143,34 @@ def generate_response(
             if bundle.processor is None:
                 raise ValueError("Qwen processor not available for image inputs.")
 
-            formatted_prompt = _format_prompt(bundle.tokenizer, prompt)
             processor = bundle.processor
-            kwargs = {"text": formatted_prompt, "return_tensors": "pt"}
-            if "images" in processor.__call__.__code__.co_varnames:
-                kwargs["images"] = image
-            elif "image" in processor.__call__.__code__.co_varnames:
-                kwargs["image"] = image
-            else:
-                raise ValueError("Processor does not accept image inputs.")
 
-            inputs = processor(**kwargs)
+            # Build a proper multimodal message with image embedded in the content list.
+            # This ensures apply_chat_template inserts the required <|vision_start|><|image_pad|>
+            # <|vision_end|> tokens into the text before the processor tokenizes it.
+            # Passing a pre-formatted plain-text string + image separately (old approach) skips
+            # image-token injection, so the model never attends to the image.
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image},
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ]
+            inputs = processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+                # Disable thinking mode: Qwen3.5 thinks by default, wrapping output in
+                # <think>...</think> before the actual answer. With max_new_tokens=32
+                # (or even 128) the model would exhaust the budget on thinking and never
+                # emit the UNSAFE/SAFE/ALIGNED token we're parsing.
+                chat_template_kwargs={"enable_thinking": False},
+            )
             input_ids = inputs.get("input_ids")
         else:
             formatted_prompt = _format_prompt(bundle.tokenizer, prompt)
@@ -143,8 +189,24 @@ def generate_response(
         if top_k is not None:
             generation_kwargs["top_k"] = top_k
 
-        with torch.inference_mode():
-            output_ids = bundle.model.generate(**inputs, **generation_kwargs)
+        try:
+            with torch.inference_mode():
+                output_ids = bundle.model.generate(**inputs, **generation_kwargs)
+        except ValueError as e:
+            # Some text-only models reject vision kwargs; fall back to text-only inputs.
+            if image is None or "model_kwargs" not in str(e):
+                raise
+            for key in (
+                "mm_token_type_ids",
+                "pixel_values",
+                "image_grid_thw",
+                "image_sizes",
+                "vision_mask",
+                "image_embeds",
+            ):
+                inputs.pop(key, None)
+            with torch.inference_mode():
+                output_ids = bundle.model.generate(**inputs, **generation_kwargs)
 
         if input_ids is None:
             decoded = bundle.tokenizer.decode(output_ids[0], skip_special_tokens=True)

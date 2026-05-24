@@ -28,6 +28,15 @@ def encode_prompt(pipe, prompt: str, device: torch.device) -> torch.Tensor:
     """
     max_len = pipe.tokenizer.model_max_length
 
+    # Always derive the target device from the text_encoder's actual location.
+    # Using the caller-supplied `device` argument can cause a cuda:N vs cuda:M
+    # mismatch after a model swap (e.g. sd3x → sd1x via swap_base_model): the
+    # new plan.base_device is updated correctly, but if diffusers materialised
+    # the text_encoder on a different GPU during from_pretrained, the argument
+    # and the weight are on different devices.  Querying the encoder directly
+    # is always correct and costs nothing extra.
+    encoder_device = next(pipe.text_encoder.parameters()).device
+
     def _enc(text: str) -> torch.Tensor:
         toks = pipe.tokenizer(
             [text],
@@ -37,7 +46,7 @@ def encode_prompt(pipe, prompt: str, device: torch.device) -> torch.Tensor:
             return_tensors="pt",
         )
         with torch.no_grad():
-            return pipe.text_encoder(toks.input_ids.to(device))[0]   # [1, 77, 768]
+            return pipe.text_encoder(toks.input_ids.to(encoder_device))[0]   # [1, 77, 768]
 
     return torch.cat([_enc(""), _enc(prompt)])   # [2, 77, 768]
 

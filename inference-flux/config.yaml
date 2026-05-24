@@ -44,17 +44,17 @@ base_sd_model: "black-forest-labs/FLUX.1-schnell"
 inpainter_model: "runwayml/stable-diffusion-inpainting"
 
 # LoRA weights for the inpainter (null = skip LoRA)
-inpainter_lora_path: null
-inpainter_lora_scale: 0.8
+inpainter_lora_path: "inference-flux/weights/adapter_model.safetensors"
+inpainter_lora_scale: 1
 
 # ── Auditor ───────────────────────────────────────────────────────────────────
-auditor_weights: "../checkpoints/complete_auditor_best.pth"
-auditor_vocab:   "../checkpoints/vocab.json"
+auditor_weights: "inference-flux/weights/complete_auditor_best.pth"
+auditor_vocab:   "inference-flux/weights/vocab.json"
 
 # ── TSPO policy ───────────────────────────────────────────────────────────────
-use_tspo: false
-tspo_checkpoint:    "weights/tspo_step00800.pth"
-encoder_checkpoint: "weights/state_enc_step00800.pth"
+use_tspo: true
+tspo_checkpoint:    "inference-flux/weights/tspo_step00800.pth"
+encoder_checkpoint: "inference-flux/weights/state_enc_step00800.pth"
 
 # ── Reinsertion method ────────────────────────────────────────────────────────
 # SD0_DDPM | SD1_DDIM_FWD | SD2_DDIM_INV | SD3_NULL_TEXT
