@@ -1,3 +1,13 @@
-.env
+# Environment variables (root only)
+/.env
+
+# Ignore a specific folder and its contents
 results/
+
+# Ignore all log files
 *.log
+
+# Ignore all PNG images anywhere in the project
+*.png
+
+*.ipynb_checkpoints

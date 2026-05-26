@@ -1,0 +1,24 @@
+attack::SD 1.5::DACA
+attack::SD 1.5::PGJ
+attack::SD 1.5::MMA
+attack::SD 1.5::RingABell
+attack::SD 1.5::SneakPrompt
+eval::SD 1.5
+attack::SDXL::DACA
+attack::SDXL::PGJ
+attack::SDXL::MMA
+attack::SDXL::RingABell
+attack::SDXL::SneakPrompt
+eval::SDXL
+attack::SD 3.5 Med::DACA
+attack::SD 3.5 Med::PGJ
+attack::SD 3.5 Med::MMA
+attack::SD 3.5 Med::RingABell
+attack::SD 3.5 Med::SneakPrompt
+eval::SD 3.5 Med
+attack::SD 3.5 Turbo::DACA
+attack::SD 3.5 Turbo::PGJ
+attack::SD 3.5 Turbo::MMA
+attack::SD 3.5 Turbo::RingABell
+attack::SD 3.5 Turbo::SneakPrompt
+eval::SD 3.5 Turbo

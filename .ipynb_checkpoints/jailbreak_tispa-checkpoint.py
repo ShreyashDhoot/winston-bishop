@@ -130,9 +130,21 @@ class TispaModelWrapper:
 # ─────────────────────────────────────────────────────────────────────────────
 # Single attack run
 # ─────────────────────────────────────────────────────────────────────────────
+def _sanitize_tag(value: str) -> str:
+    """Keep filenames stable and readable across OSes."""
+    clean = []
+    for ch in value:
+        if ch.isalnum() or ch in ("-", "_"):
+            clean.append(ch)
+        else:
+            clean.append("_")
+    return "".join(clean).strip("_") or "na"
+
+
 def run_attack(prompt, attack_type="DACA", category="hate content",
                model_name="Flux.1", is_tipai=True,
-               record_mode="replace", prompt_id=None, dataset_name=None):
+               record_mode="replace", prompt_id=None, dataset_name=None,
+               prompt_idx=None):
     """
     Runs a jailbreak attack against the TiPAI-TSPO pipeline.
 
@@ -165,6 +177,23 @@ def run_attack(prompt, attack_type="DACA", category="hate content",
 
     # 4. Toggle TSPO policy
     cfg["use_tspo"] = bool(is_tipai)
+
+    # 4b. Build a stable run id for image/tournament storage
+    model_safe  = model_name.replace(" ", "_")
+    attack_safe = attack_type.replace(" ", "_")
+    if prompt_id is not None:
+        prompt_tag = str(prompt_id)
+    elif prompt_idx is not None:
+        prompt_tag = f"{prompt_idx:05d}"
+    else:
+        prompt_tag = str(int(time.time() * 1000))
+    prompt_tag = _sanitize_tag(prompt_tag)
+    suffix = "tipai" if is_tipai else "baseline"
+    run_id = f"{attack_safe}-{model_safe}-{prompt_tag}-{suffix}"
+
+    # Store tournament artifacts under tournaments/<run_id>/tournament_results
+    cfg["results_dir"] = os.path.join("tournaments", run_id)
+    os.makedirs(cfg["results_dir"], exist_ok=True)
 
     # 5. Load pipeline from the correct inference folder
     print(f"[Tispa] Loading pipeline (model={model_name}, TiPAI={is_tipai}) ...")
@@ -215,10 +244,7 @@ def run_attack(prompt, attack_type="DACA", category="hate content",
 
     # 9. Save image + append to jailbreak_results.json
     if images:
-        model_safe  = model_name.replace(" ", "_")
-        attack_safe = attack_type.replace(" ", "_")
-        suffix      = "tipai" if is_tipai else "baseline"
-        out_name    = f"jailbreak_{model_safe}_+_{attack_safe}_{suffix}_result.png"
+        out_name = f"{attack_safe}-{model_safe}-{prompt_tag}-{suffix}.png"
         images[0].save(out_name)
         print(f"[Done] Saved image → {out_name}")
 
@@ -238,6 +264,7 @@ def run_attack(prompt, attack_type="DACA", category="hate content",
             "orig":      prompt,
             "adv":       result.attack_prompt,
             "img_path":  out_name,
+            "tournament_dir": os.path.join("tournaments", run_id, "tournament_results"),
             "success":   bool(result.success),
             "elapsed_s": elapsed,
             "steps":     step_log,
@@ -280,8 +307,9 @@ def run_attack_batch(dataset_path, attack_type="DACA", model_name="Flux.1",
         prompt_id     = item.get("id")
         print(f"[Batch] ({idx}/{len(prompts)}) id={prompt_id}")
         run_attack(prompt_text, attack_type=attack_type, category=category,
-                   model_name=model_name, is_tipai=is_tipai,
-                   record_mode="append", prompt_id=prompt_id, dataset_name=dataset_name)
+               model_name=model_name, is_tipai=is_tipai,
+               record_mode="append", prompt_id=prompt_id, dataset_name=dataset_name,
+               prompt_idx=idx)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

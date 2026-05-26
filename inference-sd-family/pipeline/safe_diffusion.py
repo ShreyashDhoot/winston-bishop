@@ -256,7 +256,13 @@ def _encode_prompt_for_pipe(pipe, prompt, plan: DevicePlan, family, dtype):
         }
 
     if family == "sd3x":
-        # SD3x: text encoders live on sd3_vae_device (explicitly placed there by loader).
+        # SD3x has three text encoders (CLIP-L, CLIP-G, T5-XXL), all on sd3_vae_device.
+        # MMA's backward pass through text_encoder can drift them off sd3_vae_device
+        # (same mechanism as the sdxl case). Re-anchor all three before encoding.
+        for attr in ("text_encoder", "text_encoder_2", "text_encoder_3"):
+            enc = getattr(pipe, attr, None)
+            if enc is not None and next(enc.parameters()).device != plan.sd3_vae_device:
+                enc.to(plan.sd3_vae_device)
         pe, npe, ppe, npp = pipe.encode_prompt(
             prompt=prompt, prompt_2=prompt, prompt_3=prompt,
             negative_prompt="", negative_prompt_2="", negative_prompt_3="",

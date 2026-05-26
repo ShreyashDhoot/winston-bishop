@@ -49,9 +49,15 @@ class GeminiChecker(BaseChecker):
                 max_new_tokens=64,
                 temperature=1e-6,
                 top_p=1.0,
+                                         # block often contains the word "UNSAFE" as part of
+                                         # its reasoning even when the conclusion is SAFE,
+                                         # causing every prompt to be falsely flagged.
             )
+            # Strip any residual thinking block before checking the label.
+            import re as _re
+            clean = _re.sub(r"<think>.*?</think>", "", content_text, flags=_re.DOTALL).strip()
             return {
-                "flagged": "UNSAFE" in content_text,
+                "flagged": "UNSAFE" in clean.upper(),
                 "response": content_text,
             }
         except Exception as e:

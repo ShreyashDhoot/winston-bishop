@@ -11,15 +11,18 @@ except Exception:  # pragma: no cover - optional dependency in older versions
     AutoProcessor = None
 
 
-import re
+_DEFAULT_MODEL_ID = os.getenv("QWEN_MODEL_ID", "Qwen/Qwen3.5-27B")
+
+
+import re as _re
 
 def _strip_thinking(text: str) -> str:
-    """Remove Qwen3.5 <think>...</think> blocks and return clean output."""
-    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-    return text.strip()
-
-
-_DEFAULT_MODEL_ID = os.getenv("QWEN_MODEL_ID", "Qwen/Qwen3.5-27B")
+    """Strip Qwen3.5 <think>...</think> blocks from output.
+    Belt-and-suspenders: even when enable_thinking=False is set correctly,
+    some processor versions silently ignore it (warning: 'chat_template_kwargs
+    is not a valid argument for this processor and will be ignored').
+    """
+    return _re.sub(r"<think>.*?</think>", "", text, flags=_re.DOTALL).strip()
 _DEFAULT_CACHE_DIR = os.getenv("QWEN_CACHE_DIR")
 _DEFAULT_TORCH_DTYPE = torch.bfloat16
 
@@ -181,8 +184,33 @@ def generate_response(
             )
             input_ids = inputs.get("input_ids")
         else:
-            formatted_prompt = _format_prompt(bundle.tokenizer, prompt)
-            inputs = bundle.tokenizer(formatted_prompt, return_tensors="pt")
+            # Use apply_chat_template directly so enable_thinking=False is honoured.
+            # Old code: _format_prompt → plain string → tokenizer(string) double-tokenizes
+            # AND silently drops enable_thinking, so Qwen3.5 thinks and exhausts
+            # max_new_tokens before emitting SAFE/UNSAFE/ALIGNED.
+            if isinstance(prompt, list):
+                messages = prompt
+            else:
+                messages = [{"role": "user", "content": prompt}]
+
+            try:
+                inputs = bundle.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_tensors="pt",
+                    return_dict=True,
+                    chat_template_kwargs={"enable_thinking": False},
+                )
+            except TypeError:
+                # Non-Qwen tokenizers don't support chat_template_kwargs / return_dict
+                inputs = bundle.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_tensors="pt",
+                    return_dict=True,
+                )
             input_ids = inputs.get("input_ids")
 
         inputs = _move_to_device(inputs, bundle.model)
