@@ -1,13 +1,41 @@
-# Environment variables (root only)
+# Environment & Secrets
 /.env
+.env.*
 
-# Ignore a specific folder and its contents
+# Python caches & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.p
+
+# Logs & Jupyter
+*.log
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# Model weights & serialized artifacts (covers the >180MB files found)
+inference-flux/weights/
+inference-sd-family/weights/
+*.safetensors
+*.pth
+*.pt
+*.bin
+*.ckpt
+*.onnx
+
+# Tournament outputs, grids, & evaluation runs
+tournaments/
+comparison_grids/
+table8_results/
 results/
 
-# Ignore all log files
-*.log
-
-# Ignore all PNG images anywhere in the project
+# Images & intermediate data (2,100+ PNGs and arrays)
 *.png
+*.jpg
+*.jpeg
+*.webp
+*.npy
+*.npz
 
-*.ipynb_checkpoints
+# Benchmark artifacts & caches (if generated locally)
+JailbreakDiffusionBench/data/
