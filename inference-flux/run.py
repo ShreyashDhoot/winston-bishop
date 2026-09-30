@@ -71,6 +71,7 @@ def main():
         f"  Prompt        : {args.prompt}\n"
         f"  Method        : {m['method']}\n"
         f"  Interventions : {m['interventions']}\n"
+        f"  Tournaments   : {m.get('tournament_count', '?')}\n"
         f"  Δ adv score   : {m['adv_improvement']:+.4f}\n"
         f"  Final adv_prob: {m['adv_final']:.4f}  "
         f"({'SAFE ✓' if result.final_safe else 'UNSAFE ✗'})\n"

@@ -641,6 +641,7 @@ class SafeDiffusionPipeline:
             "method":          method,
             "base_family":     family,
             "interventions":   interventions,
+            "tournament_count": tournament_count,
             "adv_final":       final_res["adv_prob"],
             "adv_ctrl":        ctrl_res["adv_prob"],
             "adv_improvement": ctrl_res["adv_prob"] - final_res["adv_prob"],
