@@ -86,7 +86,7 @@ if [[ "$MODE" == "all" || "$MODE" == "baselines" ]]; then
         --baseline "$B" \
         --model "$M" \
         --limit "$LIMIT" \
-        --out-dir "$SCRIPT_DIR/results" >> "$LOG_FILE" 2>&1
+        --out-dir "$SCRIPT_DIR/results" 2>&1 | tee -a "$LOG_FILE"
 
       mark_done "$KEY"
     done
@@ -114,7 +114,7 @@ if [[ "$MODE" == "all" || "$MODE" == "ablations" ]]; then
         --config "$A" \
         --model "$M" \
         --limit "$LIMIT" \
-        --out-dir "$SCRIPT_DIR/results" >> "$LOG_FILE" 2>&1
+        --out-dir "$SCRIPT_DIR/results" 2>&1 | tee -a "$LOG_FILE"
 
       mark_done "$KEY"
     done
@@ -128,7 +128,7 @@ if [[ "$MODE" == "all" ]]; then
   if ! is_done "$KEY"; then
     log "--> Starting Phase 3: Auditor External Validity Evaluation"
     python "$SCRIPT_DIR/evaluation/eval_auditor_external.py" \
-      --out-dir "$SCRIPT_DIR/results" >> "$LOG_FILE" 2>&1
+      --out-dir "$SCRIPT_DIR/results" 2>&1 | tee -a "$LOG_FILE"
     mark_done "$KEY"
     log "--> Phase 3 Complete."
   else
@@ -142,7 +142,7 @@ if [[ "$MODE" == "all" ]]; then
   if ! is_done "$KEY"; then
     log "--> Starting Phase 4: Multi-Task Loss Weight Sensitivity Sweep"
     python "$SCRIPT_DIR/ablations/sensitivity_sweep.py" \
-      --out-dir "$SCRIPT_DIR/results" >> "$LOG_FILE" 2>&1
+      --out-dir "$SCRIPT_DIR/results" 2>&1 | tee -a "$LOG_FILE"
     mark_done "$KEY"
     log "--> Phase 4 Complete."
   else
@@ -153,7 +153,7 @@ fi
 # ── Phase 5: Generate Final Tables & Publication Figures ─────────────────────
 log "--> Generating All Submission Tables and Figures"
 python "$SCRIPT_DIR/tables/generate_all_artifacts.py" \
-  --out-dir "$SCRIPT_DIR/tables/output" >> "$LOG_FILE" 2>&1
+  --out-dir "$SCRIPT_DIR/tables/output" 2>&1 | tee -a "$LOG_FILE"
 
 log "======================================================================"
 log "  ALL RUNS & ARTIFACT GENERATION COMPLETE!"

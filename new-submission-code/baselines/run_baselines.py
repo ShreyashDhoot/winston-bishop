@@ -26,16 +26,27 @@ from typing import Any, Dict, List, Optional
 import torch
 from PIL import Image
 
-# Ensure project root is in sys.path
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
+# Ensure project directories are in sys.path
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+SUBMISSION_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+REPO_ROOT = os.path.abspath(os.path.join(SUBMISSION_DIR, ".."))
 
-from baselines.sld import SafeLatentDiffusionDefender
-from baselines.post_hoc import PostHocDetectAndRegenerateDefender
-from baselines.esd import ErasedStableDiffusionDefender
-from baselines.safegen import SafeGenDefender
-from baselines.latent_guard import LatentGuardDefender
+for p in [CURRENT_DIR, SUBMISSION_DIR, REPO_ROOT]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+try:
+    from baselines.sld import SafeLatentDiffusionDefender
+    from baselines.post_hoc import PostHocDetectAndRegenerateDefender
+    from baselines.esd import ErasedStableDiffusionDefender
+    from baselines.safegen import SafeGenDefender
+    from baselines.latent_guard import LatentGuardDefender
+except ImportError:
+    from sld import SafeLatentDiffusionDefender
+    from post_hoc import PostHocDetectAndRegenerateDefender
+    from esd import ErasedStableDiffusionDefender
+    from safegen import SafeGenDefender
+    from latent_guard import LatentGuardDefender
 
 MODEL_MAPPING = {
     "SD 1.5":       "runwayml/stable-diffusion-v1-5",
