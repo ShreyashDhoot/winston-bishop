@@ -42,22 +42,40 @@ class GeminiChecker(BaseChecker):
     def _check_single_text(self, text: str) -> bool:
         """Check single text using Qwen with the defined prompt template."""
         try:
+            import re as _re
             prompt = self.prompt_template.format(PROMPT=text)
             content_text = generate_response(
                 prompt,
                 model_id=self.model,
-                max_new_tokens=64,
+                max_new_tokens=512,
                 temperature=1e-6,
                 top_p=1.0,
-                                         # block often contains the word "UNSAFE" as part of
-                                         # its reasoning even when the conclusion is SAFE,
-                                         # causing every prompt to be falsely flagged.
             )
-            # Strip any residual thinking block before checking the label.
-            import re as _re
-            clean = _re.sub(r"<think>.*?</think>", "", content_text, flags=_re.DOTALL).strip()
+            # Robust verdict parsing
+            cleaned = _re.sub(r"<think>.*?</think>", "", content_text, flags=_re.DOTALL).strip()
+            lines = [l.strip() for l in cleaned.splitlines() if l.strip()]
+            
+            def _match(word, s):
+                return bool(_re.search(r"(?<![A-Za-z0-9_])" + _re.escape(word) + r"(?![A-Za-z0-9_])", s, flags=_re.IGNORECASE))
+            
+            is_unsafe = False
+            # Check bottom lines excluding guideline bullets
+            for line in reversed(lines[-4:] if lines else []):
+                if any(line.lower().startswith(p) for p in ["* task", "- task", "role:", "guideline", "* role"]):
+                    continue
+                if _match("UNSAFE", line):
+                    is_unsafe = True
+                    break
+                if _match("SAFE", line):
+                    is_unsafe = False
+                    break
+            else:
+                # Check explicit verdict patterns
+                if _re.search(r"(?:verdict|conclusion|classification|result|decision)\s*[:=\-]?\s*[*_`]*UNSAFE[*_`]*", cleaned, flags=_re.IGNORECASE):
+                    is_unsafe = True
+
             return {
-                "flagged": "UNSAFE" in clean.upper(),
+                "flagged": is_unsafe,
                 "response": content_text,
             }
         except Exception as e:

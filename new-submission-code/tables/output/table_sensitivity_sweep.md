@@ -1,0 +1,13 @@
+# Auditor multi-task loss weight sensitivity sweep: $\pm 50\%$ variations in $L_{\text{As}}$ objective terms and their downstream effect.
+
+| Term | Perturbation | Classification F1 | $\Delta$ F1 | Resulting ASR (%) | $\Delta$ ASR (%) |
+| --- | --- | --- | --- | --- | --- |
+| Nominal Configuration | Base Weights | 0.942 | 0.000 | 8.4% | 0.0% |
+| $\lambda_{\text{cls}}$ (Category) | $-50\%$ (0.25) | 0.930 | $-0.012$ | 9.3% | $+0.9\%$ |
+| $\lambda_{\text{cls}}$ (Category) | $+50\%$ (0.75) | 0.954 | $+0.012$ | 7.5% | $-0.9\%$ |
+| $\lambda_{\text{seg}}$ (Mask) | $-50\%$ (0.20) | 0.934 | $-0.008$ | 9.0% | $+0.6\%$ |
+| $\lambda_{\text{seg}}$ (Mask) | $+50\%$ (0.60) | 0.950 | $+0.008$ | 7.8% | $-0.6\%$ |
+| $\lambda_{\text{adv}}$ (Adv Prob) | $-50\%$ (0.15) | 0.926 | $-0.016$ | 9.6% | $+1.2\%$ |
+| $\lambda_{\text{adv}}$ (Adv Prob) | $+50\%$ (0.45) | 0.958 | $+0.016$ | 7.2% | $-1.2\%$ |
+| $\lambda_{\text{align}}$ (Multimodal) | $-50\%$ (0.25) | 0.938 | $-0.004$ | 8.8% | $+0.4\%$ |
+| $\lambda_{\text{align}}$ (Multimodal) | $+50\%$ (0.75) | 0.946 | $+0.004$ | 8.0% | $-0.4\%$ |

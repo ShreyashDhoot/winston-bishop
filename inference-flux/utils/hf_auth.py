@@ -75,10 +75,23 @@ def resolve_hf_token(explicit_token: str | None = None) -> str | None:
         try:
             from huggingface_hub import login
             login(token=token, add_to_git_credential=False)
-            print("[HF Auth] Authenticated with HuggingFace token.")
+            print("[HF Auth] Authenticated with HuggingFace token from environment.")
         except Exception as e:
-            warnings.warn(f"[HF Auth] huggingface_hub.login() failed: {e}", stacklevel=2)
+            warnings.warn(f"[HF Auth] huggingface_hub.login() failed: {e}. Falling back to cached CLI credentials.", stacklevel=2)
+            try:
+                from huggingface_hub import get_token
+                token = get_token()
+            except Exception:
+                token = None
     else:
+        try:
+            from huggingface_hub import get_token
+            token = get_token()
+            if token:
+                print("[HF Auth] Using active login token from `hf auth login`.")
+                return token
+        except Exception:
+            pass
         print("[HF Auth] No HF_TOKEN found — unauthenticated. Gated models will fail.")
 
     return token

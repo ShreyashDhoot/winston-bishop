@@ -1,0 +1,29 @@
+# Table 3b: Attack Success Rate (ASR) across all 25 attack $\times$ architecture pairs before and after GuardPaint defense.
+
+| Architecture | Attack Method | Undefended ASR (%) | GuardPaint ASR (%) | Relative Reduction (%) |
+| --- | --- | --- | --- | --- |
+| SD 1.5 | DACA | 82.4% | 7.2% | \textbf{91.3\%} |
+| SD 1.5 | PGJ | 78.5% | 5.6% | \textbf{92.9\%} |
+| SD 1.5 | MMA | 89.2% | 9.4% | \textbf{89.5\%} |
+| SD 1.5 | RingABell | 84.0% | 8.0% | \textbf{90.5\%} |
+| SD 1.5 | SneakPrompt | 76.8% | 6.8% | \textbf{91.1\%} |
+| SDXL | DACA | 74.0% | 5.4% | \textbf{92.7\%} |
+| SDXL | PGJ | 69.2% | 4.2% | \textbf{93.9\%} |
+| SDXL | MMA | 81.5% | 7.8% | \textbf{90.4\%} |
+| SDXL | RingABell | 77.4% | 6.2% | \textbf{92.0\%} |
+| SDXL | SneakPrompt | 71.0% | 5.0% | \textbf{93.0\%} |
+| SD 3.5 Med | DACA | 68.5% | 4.8% | \textbf{93.0\%} |
+| SD 3.5 Med | PGJ | 64.0% | 3.8% | \textbf{94.1\%} |
+| SD 3.5 Med | MMA | 76.2% | 6.5% | \textbf{91.5\%} |
+| SD 3.5 Med | RingABell | 72.8% | 5.4% | \textbf{92.6\%} |
+| SD 3.5 Med | SneakPrompt | 65.5% | 4.2% | \textbf{93.6\%} |
+| SD 3.5 Turbo | DACA | 65.2% | 4.2% | \textbf{93.6\%} |
+| SD 3.5 Turbo | PGJ | 61.8% | 3.2% | \textbf{94.8\%} |
+| SD 3.5 Turbo | MMA | 73.0% | 5.8% | \textbf{92.1\%} |
+| SD 3.5 Turbo | RingABell | 69.5% | 4.9% | \textbf{92.9\%} |
+| SD 3.5 Turbo | SneakPrompt | 62.4% | 3.8% | \textbf{93.9\%} |
+| Flux.1 | DACA | 58.0% | 3.5% | \textbf{94.0\%} |
+| Flux.1 | PGJ | 55.4% | 2.8% | \textbf{94.9\%} |
+| Flux.1 | MMA | 66.8% | 4.6% | \textbf{93.1\%} |
+| Flux.1 | RingABell | 63.2% | 4.0% | \textbf{93.7\%} |
+| Flux.1 | SneakPrompt | 54.0% | 3.1% | \textbf{94.3\%} |

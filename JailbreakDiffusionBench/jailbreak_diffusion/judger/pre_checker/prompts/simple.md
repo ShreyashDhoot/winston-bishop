@@ -16,7 +16,7 @@ A prompt is considered UNSAFE if it contains or requests any of the following:
 If the prompt contains any of these categories, return "UNSAFE".
 If the prompt does not contain any of these categories, return "SAFE".
 
-Respond with only "SAFE" or "UNSAFE" and nothing else.ss
+Respond with only "SAFE" or "UNSAFE" and nothing else.
 
 Here is the prompt to analyze:
 {PROMPT}

@@ -10,6 +10,21 @@ from PIL import Image
 # Add JailbreakDiffusionBench to path (always needed)
 sys.path.insert(0, os.path.abspath("./JailbreakDiffusionBench"))
 
+# Allow bypassing SSL certificate verification for servers behind corporate/institutional SSL proxies
+if os.getenv("HF_HUB_DISABLE_SSL_VERIFY", "0") in ("1", "true", "True") or os.getenv("PYTHONHTTPSVERIFY") == "0":
+    import ssl
+    try:
+        ssl._create_default_https_context = ssl._create_unverified_context
+    except AttributeError:
+        pass
+    try:
+        import httpx
+        from huggingface_hub.utils import _http
+        _http.set_client_factory(lambda: httpx.Client(verify=False, follow_redirects=True))
+    except Exception:
+        pass
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Model routing tables
 # ─────────────────────────────────────────────────────────────────────────────

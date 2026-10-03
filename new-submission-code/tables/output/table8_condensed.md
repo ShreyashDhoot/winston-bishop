@@ -1,0 +1,9 @@
+# Condensed Table 8: Runtime cost breakdown across correction budgets $c \in \{3, 5, 7\}$ and model families.
+
+| Model Family | Base Latency | c=3 Total (s) | c=5 Total (s) | c=7 Total (s) | Auditor Overhead | Tournament Overhead |
+| --- | --- | --- | --- | --- | --- | --- |
+| SD 1.5 (UNet) | 2.8s | 4.9s | 6.2s | 7.8s | 0.32s | 0.18s |
+| SDXL (UNet) | 4.6s | 7.5s | 9.4s | 11.6s | 0.45s | 0.22s |
+| SD 3.5 Med (Flow) | 6.8s | 10.2s | 12.8s | 15.4s | 0.52s | 0.28s |
+| SD 3.5 Turbo (Flow) | 3.5s | 6.4s | 8.1s | 10.0s | 0.48s | 0.25s |
+| FLUX.1-dev (Flow) | 11.2s | 15.8s | 19.5s | 23.4s | 0.68s | 0.35s |
