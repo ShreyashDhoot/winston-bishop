@@ -1,0 +1,195 @@
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Training Dataset Construction}
+\label{app:dataset}
+% ─────────────────────────────────────────────────────────────────────────────
+
+This appendix details the construction of the 82K image--prompt corpus used
+to train the Auditor-Scorer $\As$, covering source datasets, prompt
+reconstruction, labeling pipeline design, and labeling quality.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Source Datasets}
+\label{app:dataset_sources}
+% ─────────────────────────────────────────────────────────────────────────────
+
+We draw from eight publicly available HuggingFace datasets spanning three
+content categories: safe, nudity, and violence.
+Table~\ref{tab:dataset} summarizes each source, its nominal category,
+and whether prompts were available or reconstructed.
+
+\begin{table*}[!ht]
+\centering
+\small
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.15}
+\caption{Source datasets for the 82K auditor training corpus from huggingface.}
+\label{tab:dataset}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Dataset} & \textbf{Category} & \textbf{Prompts} \\
+\midrule
+\texttt{Subh775/WeaponDetection} \cite{yolov7test_weapon_detection}              & Violence         & VLM-generated \\
+\texttt{NeuralShell/Gore-Blood-Dataset-v1.0} \cite{Gore-Blood-Dataset-v1.0}  & Violence         & VLM-generated \\
+\texttt{x1101/nsfw-full}                      & Nudity           & VLM-generated \\
+\texttt{Lenkashell/unsafe\_violence\_image\_captions}  & Violence  & Existing \\
+\texttt{Lenkashell/unsafe\_shocking\_image\_captions}  & Violence  & Existing \\
+\texttt{yiting/UnsafeBench}\cite{10.1145/3719027.3765088}                   & Nudity, Violence & Existing \\
+\texttt{OpenSafetyLab/t2i\_safety\_dataset}\cite{Li_2025_CVPR}   & Nudity, Violence & Existing \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Sources were selected to cover both the nudity and violence policy axes with
+sufficient volume and diversity of visual style, scene complexity, and
+severity level. Datasets with pre-existing captions were used as-is after
+cleaning; datasets without prompts required reconstruction (see
+Section~\ref{app:prompt_reconstruction}).
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Prompt Reconstruction}
+\label{app:prompt_reconstruction}
+% ─────────────────────────────────────────────────────────────────────────────
+
+Four source datasets did not include generation prompts. For these, image
+captions were synthesized using Qwen2.5-VL~\cite{bai2025qwen25vltechnicalreport}
+as a surrogate prompt. The model was instructed to produce a concise,
+descriptive caption in the style of a text-to-image generation prompt rather
+than a natural-language description, targeting the visual content of the image
+without editorializing about policy compliance. These reconstructed captions
+serve the faithfulness branch of the auditor during training and are not used
+for any safety label decision.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Labeling Pipeline}
+\label{app:labeler_ablation}
+% ─────────────────────────────────────────────────────────────────────────────
+
+All images---regardless of source label---were relabeled into three mutually
+exclusive categories: $\{\mathrm{safe},\,\mathrm{nudity},\,\mathrm{violence}\}$.
+Multi-label annotation was evaluated and discarded: overlapping soft gradients
+from multi-label supervision degraded auditor classification performance in
+preliminary experiments. One-hot categorization was therefore adopted as the
+final labeling scheme.
+
+\paragraph{Labeler selection.}
+We evaluated five candidate VLMs as automated labelers. Each was assessed on
+a manually inspected reference set of hard cases including bikinis, underwear,
+sports scenes with physical contact, crowds, close interpersonal proximity,
+and classical artwork (e.g., Greek nude sculpture). The reference set was
+chosen to stress-test policy-boundary behavior rather than gross violations,
+which all models handle trivially.
+
+Table~\ref{tab:labeler_ablation} summarizes observed failure modes.
+
+\begin{table}[h]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.2}
+\caption{Labeler ablation: observed failure modes on the hard-case calibration
+set. FP = false positive rate; FN = false negative rate on the calibration
+reference.}
+\label{tab:labeler_ablation}
+\begin{tabular}{p{0.22\linewidth}p{0.68\linewidth}}
+\toprule
+\textbf{Model} & \textbf{Observed failure mode} \\
+\midrule
+Qwen2.5-VL (7B) &
+  Basic prompting yields high FP rate; chain-of-thought prompting introduces
+  label contradictions; self-consistency is slow and inconsistent;
+  few-shot prompting degrades prompt-following according to community
+  reports. \\
+\addlinespace
+Qwen3-VL &
+  Similar failure pattern to Qwen2.5-VL; no improvement on boundary cases. \\
+\addlinespace
+ShieldGemma (vanilla) &
+  Slow inference; inconsistent categorization on borderline cases without
+  fine-tuning; high FN rate overall. \\
+\addlinespace
+Grounding DINO~\cite{liu2023gdino} &
+  Highly threshold-sensitive (small shift produces either high FP or high
+  FN); lacks semantic context for borderline cases (\eg, classical nude
+  sculpture). \\
+\addlinespace
+\textbf{InternVL-3.5 (8B)} &
+  \textbf{Best overall performance}: lowest FP rate; strong contextual
+  nuance (\eg, correctly categorizes classical nude sculptures as safe);
+  conservative on FN (acceptable for training corpus construction). \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+InternVL-3.5 (8B) was selected as the final labeler based on this ablation.
+
+\paragraph{Why chain-of-thought prompting was de-emphasized.}
+Explicit chain-of-thought prompting increases verbosity without reliably
+improving category fidelity. On ambiguous images, it causes models to
+generate unsupported post-hoc rationales or self-contradictory
+intermediate reasoning that conflicts with the final label.
+Self-consistency (repeated passes with majority voting) was also rejected: it
+increases inference cost substantially while failing to correct systematic
+classification errors caused by stable policy-boundary confusion---the primary
+failure mode on borderline cases.
+
+\paragraph{Policy-first prompt design.}
+The InternVL-3.5 prompt was designed to be policy-oriented rather than
+explanation-oriented. Categories are defined in operational terms directly tied
+to visual evidence:
+
+\begin{itemize}[leftmargin=1.2em,itemsep=2pt,topsep=2pt]
+  \item \textbf{Nudity:} Swimwear, underwear,
+        medical imagery, and athletic clothing are explicitly safe.
+  \item \textbf{Violence:} visible physical harm or graphic cues such as
+        blood or weapons in active use. Proximity, sparring poses, and
+        non-graphic contact are safe.
+  \item \textbf{Safe:} all other content, including classical artwork with
+        nudity, sports imagery without graphic harm, and intimate proximity
+        without explicit content.
+\end{itemize}
+
+This framing prevents surface-level cue triggering (e.g., visible skin area,
+figure proximity, athletic posture) which was the dominant failure pattern
+across rejected labelers.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Threshold Calibration and Dead-Zone Exclusion}
+\label{app:threshold_calibration}
+% ─────────────────────────────────────────────────────────────────────────────
+
+InternVL-3.5 produces a continuous policy score for each image. Because no
+large ground-truth labeled set was available for data-driven threshold
+selection, the operating threshold was calibrated empirically against the
+same manually inspected hard-case reference set used for labeler ablation.
+Model scores were compared against human judgment on this subset, and the
+threshold was set to reflect the desired moderation policy rather than an
+externally optimized operating point.
+
+A \textbf{dead zone} was reserved around the threshold: images whose scores
+fell within a margin of the decision boundary were excluded from the training
+corpus entirely rather than assigned an arbitrary label. This exclusion
+strategy ensures that the high-confidence tails of the score distribution---
+where label quality is highest---dominate training, while uncertain borderline
+samples do not introduce spurious supervision signal.
+
+\paragraph{Residual label noise.}
+The most likely residual failure mode from single-shot VLM scoring is not
+catastrophic random mislabeling but systematic boundary bias: InternVL-3.5
+may mildly over-score skin-heavy but policy-safe images (e.g., bikini
+photographs), causing a fraction of such cases to drift above the nudity
+threshold. This produces moderate boundary noise in the minority class rather
+than label collapse. For auditor training, such boundary noise is manageable
+provided the high-confidence tails remain clean---which the dead-zone
+exclusion strategy is designed to ensure.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Dataset Statistics and Splits}
+\label{app:dataset_stats}
+% ─────────────────────────────────────────────────────────────────────────────
+
+The final labeled corpus contains 82,000 image--prompt pairs distributed
+across the three categories. After dead-zone exclusion of boundary cases, the
+corpus was split into training, validation, and test sets using a
+70\,/\,15\,/\,15 stratified partition, preserving class proportions across
+splits. The test set was held out entirely for the classification evaluation
+reported in Table~\ref{tab:auditor_perf}.

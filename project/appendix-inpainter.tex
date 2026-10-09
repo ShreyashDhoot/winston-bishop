@@ -1,0 +1,882 @@
+%% ════════════════════════════════════════════════════════════════════════════
+%% APPENDIX: Policy-Aligned Inpainter --- SFT and BCO Training Pipeline
+%% ════════════════════════════════════════════════════════════════════════════
+
+\section{Policy-Aligned Inpainter: SFT and BCO Training Details}
+
+This appendix documents the complete training pipeline for the policy-aligned
+inpainter $\mathcal{A}_g$, covering: the Refusal SFT stage
+(\S\ref{app:sft}), the alignment objective selection and the migration from KTO to BCO (\S\ref{app:algo_choice}--\ref{app:kto_to_bco}), the full BCO loss formulation and motivations (\S\ref{app:bco_full}), the
+failure archaeology from all training runs (\S\ref{app:failure_modes}), and
+the final validated training configuration (\S\ref{app:final_config}).
+
+%% ────────────────────────────────────────────────────────────────────────────
+\subsection{Alignment Objective Selection: Why KTO and BCO}
+\label{app:algo_choice}
+%% ────────────────────────────────────────────────────────────────────────────
+
+\paragraph{Dataset constraints.}
+Modern RLHF methods impose different data-preparation burdens.
+DPO~\cite{wallace2023diffusion_dpo} requires \emph{paired} (chosen, rejected)
+completions for every prompt; for images this demands either human preference
+labelling or an expensive oracle model.
+
+KTO~\cite{li2024diffusion_kto} and BCO~\cite{jung2024bco} both operate on
+\emph{unpaired} binary-labelled data $(x, y)\in\{0,1\}$, where $y=1$
+denotes a safe (desirable) completion and $y=0$ denotes a policy-violating
+(undesirable) one.
+This format is produced directly by the auditor, requiring no
+additional human annotation.
+
+\paragraph{Risk profile motivation.}
+For a content-safety inpainter, the error costs are highly asymmetric:
+a false negative (generating adversarial material undetected) is far more
+costly than a false positive (over-suppressing a benign region).
+KTO was initially chosen specifically for its loss-averse utility function
+and its asymmetric treatment of gains and losses, properties that appeared
+well-suited to this risk profile.
+
+%% ────────────────────────────────────────────────────────────────────────────
+\subsection{Refusal SFT - LoRA Fine-Tuning}
+\label{app:sft}
+%% ────────────────────────────────────────────────────────────────────────────
+
+\paragraph{Motivation: the know-before-you-refuse principle.}
+The LLM training paradigm provides a useful analogy: instruction tuning
+precedes alignment because a model must first \emph{know how to perform a
+task} before it can refuse it in a principled way.
+Applying an alignment signal directly to a model with no prior concept of
+``safe inpainting'' is under-constrained: the model has no learned attractor
+basin for policy-compliant completions, so the alignment gradient has
+nothing to guide it toward.
+
+Formally, let $\pi_\theta$ be the inpainter policy and $\mathcal{R}$ the
+target ``refusal manifold'' in latent space---the set of completions that
+replace NSFW content with spatially coherent, policy-compliant alternatives.
+An alignment objective such as BCO applies a gradient
+$\nabla_\theta \mathcal{L}_\text{BCO}$ that rewards distance from the
+policy-violating attractor.
+However, if $\mathcal{R}$ is not already in the support of $\pi_\theta$,
+the gradient has no preferred direction in which to move the policy; it
+merely pushes it \emph{away} from the violation without specifying
+\emph{where} to go.
+SFT pre-seeds the policy with a collapsed distribution over $\mathcal{R}$,
+giving the BCO gradient a meaningful signal basin to expand.
+
+In our training logs, this manifests clearly: the BCO run starting from an
+SFT-initialised checkpoint exhausts its SFT prior through approximately
+step~500, then searches the manifold for an exploit.
+The asymmetric auxiliary losses (reconstruction and identity, detailed
+in \S\ref{app:bco_full}) constrain this search to a corridor that
+eventually leads to the globally optimal solution---rendering coherent
+clothing.
+A BCO run starting from a vanilla SD-inpainting checkpoint does not exhibit
+this three-phase structure; it collapses directly to the pixel-smudging
+attractor with no recovery.
+
+\paragraph{Base model and adapter.}
+SFT training starts from \emph{runwayml/stable-diffusion-inpainting}, a
+9-channel inpainting UNet conditioned on
+$(z_t \in \mathbb{R}^{4}, m_\ell \in \mathbb{R}^{1}, \tilde{z}_0 \in
+\mathbb{R}^{4})$, where $m_\ell$ is the latent-space mask and $\tilde{z}_0$
+is the masked image latent.
+We apply LoRA~\cite{hu2022lora} with rank $r{=}64$, $\alpha{=}64$
+(effective scale $= \alpha/r = 1.0$, i.e.\ no implicit scaling)
+targeting the following parameter groups:
+\begin{itemize}[leftmargin=1.5em,itemsep=1pt,topsep=2pt]
+  \item Cross- and self-attention:
+        \emph{to\_q}, \emph{to\_k}, \emph{to\_v}, \emph{to\_out.0}
+  \item Feed-forward layers in transformer blocks:
+        \emph{ff.net.0.proj}, \emph{ff.net.2}
+  \item Spatial projection layers: \emph{proj\_in}, \emph{proj\_out}
+  \item ResNet convolutional layers (structural/spatial output):
+        \emph{conv1}, \emph{conv2}
+  \item UNet input convolution layer: \texttt{conv\_in}
+\end{itemize}
+
+The inclusion of \emph{conv\_in} is critical.
+The 9-channel inpainting UNet differs from the standard 4-channel text-to-image
+UNet in precisely this first layer: it processes the concatenated
+$(z_t, m_\ell, \tilde{z}_0)$ tensor.
+Leaving \emph{conv\_in} frozen during alignment causes the
+mask-conditioning logic to resist policy signals, because the gradient
+from the loss cannot propagate into the layer that interprets which pixels
+to modify.
+Similarly, the ResNet convolutional layers (\emph{conv1}, \emph{conv2})
+handle the structural and spatial content of the output.
+Refusal requires rendering new content (clothing, blurred faces)---a
+structural operation---and attention-only LoRA lacks the representational
+capacity for such changes.
+
+Stage B-2 uses rank $r{=}128$, $\alpha{=}128$ for the alignment phase,
+on the hypothesis that the earlier runs with smaller rank were exhausting
+LoRA capacity and saturating prematurely.
+
+\paragraph{Training data.}
+The SFT dataset consists of approximately 2\,000 images (1\,000 nudity
+violations, 1\,000 violence violations).
+For each unsafe source image, the auditor generates a mask over the
+policy-violating region.
+The source image and mask are then passed to the inpainter with a
+custom-generated safe prompt (derived by prompting a Qwen-2.5-VL captioner
+followed by a LLaMA-8B rewriter) to produce a target ``accepted'' image.
+Training pairs are therefore $(x_\text{unsafe}, m, x_\text{safe}, p_\text{unsafe})$:
+the unsafe source, its violation mask, the human-approved safe target, and
+the original adversarial prompt.
+
+Training on the \emph{adversarial} prompt rather than the safe prompt is
+deliberate: at inference, the inpainter receives the adversarial prompt
+because the user's intent is unknown.
+The model must learn the pixel-space signature of a safe completion
+conditioned on an unsafe prompt---not relying on text-based cues to trigger
+refusal.
+
+\paragraph{Loss and schedule.}
+The SFT loss is Min-SNR~\cite{hang2023minsnr} weighted MSE across the full
+noise schedule $t \in [0, 1000)$:
+\[
+  \mathcal{L}_\text{SFT} = \mathbb{E}_{t,\epsilon}\!\left[
+    w(t)\cdot
+    \|\epsilon_\theta(\begin{aligned}z_t, t, m_\ell, \\ \tilde{z}_0, p_\text{unsafe} \end{aligned}) 
+     - \epsilon\|^2
+  \right],
+  \label{eq:sft_loss}
+\]
+where $w(t) = \min(\text{SNR}(t), \gamma)/\text{SNR}(t)$ with $\gamma{=}5$.
+Without Min-SNR reweighting, high-noise timesteps (large $t$) dominate the
+gradient because the signal-to-noise ratio is low and the loss magnitude is
+large.
+This matters here because safe completions are visually coherent only at
+\emph{low} noise levels ($t \ll 500$); high-noise gradients contribute
+primarily noise-level statistics and not the structural pattern of
+clothing or background fill.
+Min-SNR redistributes gradient mass toward the low-noise regime where the
+visual content of the refusal is actually resolved.
+
+Formally, the Min-SNR weight is derived from the signal-to-noise ratio
+$\text{SNR}(t) = \bar\alpha_t / (1 - \bar\alpha_t)$, where
+$\bar\alpha_t = \prod_{s=1}^t \alpha_s$ is the cumulative product of the
+noise schedule.
+The clamp at $\gamma$ prevents the weight from collapsing to zero at very
+low $t$ (where SNR is enormous), maintaining gradient flow throughout the
+schedule.
+
+A small noise offset of $0.05$ is added:
+$\epsilon' = \epsilon + 0.05 \cdot \epsilon_0$ where $\epsilon_0 \sim
+\mathcal{N}(0, I_{C \times 1 \times 1})$ is broadcast.
+This offset helps with dark and saturated regions---common in clothing
+inpainting---by preventing the VAE latent distribution from collapsing into
+degenerate attractors near the boundary of its quantization grid.
+
+After convergence (loss plateau below $\sim$0.07 over 8 epochs), the LoRA
+weights are merged into the base checkpoint via \texttt{merge\_and\_unload()},
+producing a single 9-channel UNet used as the Stage B-2 initialisation.
+
+\paragraph{How SFT initialises BCO: a geometric argument.}
+Let $\mathcal{M}_\text{img}$ denote the natural image manifold in latent
+space and $\mathcal{M}_\text{safe} \subset \mathcal{M}_\text{img}$ the
+submanifold of safe completions inside the mask.
+Pre-SFT, $\pi_\theta$ (the base inpainting model) has learned a strong
+prior toward $\mathcal{M}_\text{img}$ conditioned on the input context, but
+has never encountered a training signal that distinguishes
+$\mathcal{M}_\text{safe}$ from the rest of the manifold.
+
+SFT provides approximately 2\,000 examples of $(x_\text{unsafe}, m,
+x_\text{safe})$ triples.
+The MSE loss \eqref{eq:sft_loss} carves a narrow basin in the loss
+landscape centred on $\mathcal{M}_\text{safe}$ for inputs of the form
+$(z_t, m_\ell, \tilde{z}_0, p_\text{unsafe})$.
+After SFT, $\pi_\theta$ has a collapsed mode at clothing/covering
+completions for masked unsafe inputs.
+
+BCO then operates on this initialised policy.
+The BCO gradient moves the policy such that:
+(a) on safe inputs, the policy stays near or improves upon the reference;
+(b) on unsafe inputs, the policy deliberately degrades relative to the
+reference (moves further from the policy-violating content).
+Because the SFT basin already exists, the BCO search for ``worse on
+unsafe'' lands directly on $\mathcal{M}_\text{safe}$ rather than on
+degenerate off-manifold solutions.
+This explains the three-phase dynamics observed in BCO training: the SFT prior
+is exploited first (Phase 1), the degenerate attractor is blocked by
+auxiliary losses (Phase 2), and the SFT basin is rediscovered as the
+unique viable optimum (Phase 3).
+
+%% ────────────────────────────────────────────────────────────────────────────
+\subsection{KTO: Formulation, Experiments, and Failure Modes}
+\label{app:kto_to_bco}
+%% ────────────────────────────────────────────────────────────────────────────
+
+We now document the KTO implementation and the concrete failure modes that motivated the switch to BCO.
+
+\subsubsection{KTO Formulation}
+
+The KTO objective~\cite{ethayarajh2024ktomodelalignmentprospect} for diffusion models \cite{li2024diffusion_kto} adapts the
+Kahneman--Tversky prospect-theoretic value function to the noise-prediction setting.
+Our implementation computes a ``g-term'' as:
+\begin{equation}
+  g_i = \ell^\theta_i - \ell^\text{ref}_i, \notag
+  \label{eq:kto_gterm}
+\end{equation}
+where $\ell^\bullet_i$ is the masked MSE of model $\bullet$ against the
+clean latent $z_0$ inside the mask:
+\begin{equation}
+  \ell^\bullet_i
+  = \frac{\sum_{b,c,h,w} (1 + \lambda_m m_\ell) \cdot
+      (\hat{z}_0^\bullet - z_0)^2 \cdot m_\ell}
+    {\sum m_\ell}. \notag
+  \label{eq:masked_mse}
+\end{equation}
+A positive $g_i$ means the trainable model has drifted further from $z_0$
+than the reference inside the mask---\emph{worse} alignment with the safe target.
+
+The signal is centered using an EMA over safe samples:
+\[
+  \delta_\text{ema} \leftarrow 0.99\,\delta_\text{ema}
+    + 0.01\,\bar{g}|_{\text{safe}},
+  \quad \label{eq:kto_ema}
+\]
+\[
+  \delta_\text{ema} \in [-0.02, 0.05].
+\]
+The centered signal drives a sigmoid-based loss:
+\begin{equation}
+  h_i = \sigma\!\left(\text{sgn}_i \cdot \beta \cdot (g_i - \delta_\text{ema})\right),
+  \quad \notag
+  \end{equation}
+  \begin{equation}
+  \mathcal{L}_\text{KTO} = \mathbb{E}_i\!\left[w_y \cdot (1 - h_i)\right], \notag
+  \label{eq:kto_loss}
+\end{equation}
+where $\text{sgn}_i = +1$ for safe samples and $-1$ for unsafe,
+$\beta = 7$, and $w_y \in \{1.0, 5.0, 12.0\}$ for safe, nudity, and
+violence classes respectively.
+
+\subsubsection{KTO Experiment Progression}
+
+\paragraph{Vanilla KTO.}
+The first KTO implementation used a static reference model and the
+$\epsilon$-space MSE as a proxy for the probability of generating
+policy-violating content.
+The model quickly found a degenerate attractor: generating uniform blue
+patches inside the masked region.
+This trivially reduced the noise-prediction MSE difference relative to the
+reference (whose MSE was also high at the same patches) while producing
+visually incoherent output.
+The model had hacked the reward by leaving the image manifold entirely.
+
+\paragraph{Dynamic reference.}
+To prevent manifold departure, we tried updating the reference model every
+$N$ gradient steps.
+This accelerated instability: accumulated errors in the trainable model
+were passed to the reference model, which then guided training toward its
+own failures in a positive-feedback loop.
+Image quality outside the mask degraded correspondingly.
+
+\paragraph{Reconstruction and identity losses.}
+To anchor the model to the image manifold, we introduced two auxiliary
+losses (described fully in \S\ref{app:bco_full}):
+a reconstruction loss penalising noise-prediction error outside the mask,
+and an identity guardrail penalising $\hat{z}_0$-space divergence from the
+reference.
+These improved manifold stability but introduced a new failure mode: the
+model learned to smudge hands, feet, and peripheral body parts inside the
+mask---a pixel-destruction strategy that achieved low KTO/BCO loss while
+staying near the identity boundary.
+
+\paragraph{Modified loss formulation.}
+We observed that the reference model did not always generate a
+policy-violating inpaint, especially for prompts that did not explicitly
+mention NSFW content (Qwen-2.5-VL captions tend to be descriptive rather
+than explicit).
+We reframed the problem as alignment \emph{and} safety-quality improvement,
+computing the g-term as the difference of MSEs against ground-truth noise
+rather than against the reference.
+Results were similar.
+
+\paragraph{Prompt dropout.}
+Observing that the cross-attention layers were overweighted (higher
+activation delta than before the manifold dip and after recovery), we
+suspected the cross-attention was learning to key on NSFW token patterns
+rather than visual features.
+We introduced 30\% prompt dropout per batch, zeroing the text conditioning
+to force spatial grounding of the refusal signal.
+This engineering choice is retained in the BCO configuration.
+
+\subsubsection{Why KTO Failed: Theoretical Analysis}
+
+\paragraph{Failure Mode 1: $\epsilon$-space stochasticity.}
+The KTO g-term \eqref{eq:kto_gterm} is computed from $\hat{z}_0$
+predictions, but the $\hat{z}_0$ reconstruction is itself a function of
+the noise $\epsilon$ sampled at each step.
+At high timesteps $t \sim \mathcal{U}[500, 1000)$, the standard deviation
+of $\epsilon$ is $\sim\!\mathcal{O}(1)$, and the resulting variance in the
+masked MSE across samples from the same image at the same $t$ is
+$\mathcal{O}(10^{-1})$.
+The preference gap between safe and unsafe images in our dataset is
+$\mathcal{O}(10^{-2})$.
+Consequently, the signal-to-noise ratio of the preference gradient is less
+than 1; the loss tracks noise-schedule variance rather than safety
+information.
+This produces the characteristic flat
+$h_\text{safe} \approx h_\text{unsafe} \approx 0.500$ plateau observed in
+early KTO runs.
+
+\paragraph{Failure Mode 2: Asymmetric risk cannot be encoded cleanly.}
+KTO uses $(1 - \sigma(x))$ as its loss function, which is equivalent to
+$\log \sigma(-x)$ up to sign.
+The curvature of this function is symmetric in $x$: moving the policy away
+from a violation provides the same gradient magnitude as moving it toward
+a safe completion.
+Our risk profile is strongly asymmetric: false negatives on unsafe content
+(NSFW output reaches the user) are far more costly than false positives
+(over-suppression of benign content).
+KTO has no mechanism to encode this asymmetry beyond the class weights
+$w_y$, which scale the loss magnitude but not the gradient shape.
+
+Additionally, KTO's EMA baseline is computed from safe samples only
+(\eqref{eq:kto_ema}), then subtracted from both safe \emph{and} unsafe
+g-terms.
+This conflates the distributional statistics of two distinct populations:
+safe images (where $g \approx 0$ under a well-behaved policy) and unsafe
+images (where $g \gg 0$ is desirable).
+Subtracting a safe-derived baseline from the unsafe signal systematically
+miscalibrates the centering.
+
+\paragraph{Failure Mode 4: Identity loss bleeds globally.}
+The KTO implementation computes the identity gap as a single global scalar:
+\begin{equation}
+  \ell_\text{id} = \big(\|{\hat{z}_0^\theta - \hat{z}_0^\text{ref}}\|^2 - 0.02\big)_+^2, \notag
+\end{equation}
+aggregated over all samples.
+A single severely drifted sample inflates this scalar, raising the penalty
+for all other samples and causing the optimizer to over-regularize the
+well-behaved ones.
+The resulting signal is poorly calibrated and impedes the policy's ability
+to diverge from the reference on unsafe samples---which is precisely the
+desired behavior.
+
+%% ────────────────────────────────────────────────────────────────────────────
+\subsection{BCO Loss: Full Formulation with Proofs and Motivations}
+\label{app:bco_full}
+%% ────────────────────────────────────────────────────────────────────────────
+
+BCO~\cite{jung2024bco} reformulates the alignment objective as binary
+classification: a sample is ``desirable'' ($y=1$) if it should be
+encouraged and ``undesirable'' ($y=0$) if it should be suppressed.
+The following sections derive each component of the BCO loss from first
+principles.
+
+\subsubsection{Why $\hat{z}_0$, Not $\epsilon$}
+
+Standard diffusion training minimises noise-prediction MSE
+$\|\epsilon_\theta - \epsilon\|^2$.
+At timestep $t$, the magnitude of $\epsilon$ is $\sim\!\mathcal{O}(1)$, so
+small changes in $\epsilon_\theta$ produce large, timestep-dependent changes
+in the MSE.
+A reward computed from $\|\epsilon_\theta - \epsilon\|^2$ is therefore
+dominated by $t$, making per-class weighting meaningless---a sample at
+$t=900$ produces 10--100$\times$ the loss magnitude of the same sample at
+$t=100$.
+
+Instead, both UNets predict the clean latent:
+\begin{equation}
+  \hat{z}_0^\bullet
+  = \frac{z_t - \sqrt{1-\bar\alpha_t}\,\epsilon_\bullet}{\sqrt{\bar\alpha_t}},
+  \quad \bullet \in \{\theta, \text{ref}\}. \notag
+  \label{eq:z0hat}
+\end{equation}
+The denominator $\sqrt{\bar\alpha_t}$ ranges from approximately $1.0$
+(at $t=0$) to $\sim$0.01 (at $t=999$).
+While $\hat{z}_0$ predictions are noisier at high $t$, they are calibrated
+to the same latent space regardless of $t$: $\hat{z}_0 \in
+[-3\sigma_{z_0}, +3\sigma_{z_0}]$ with bounded variance.
+This invariance is the key property: per-class weights now operate on a
+reward signal with consistent scale, making nudity weight $5.0\times$ and
+violence weight $12.0\times$ interpretable as actual preference ratios.
+
+\subsubsection{Masked MSE Reward}
+
+The reward quantifies how much better the trainable policy reconstructs
+the safe target inside the mask, relative to the frozen reference:
+\begin{align}
+  w &= 1 + \lambda_m \cdot m_\ell, \quad \lambda_m = 0.5, \notag
+  \\
+  \ell_\bullet &= \frac{\sum_{b,c,h,w} w \cdot (\hat{z}_0^\bullet - z_0)^2 \cdot m_\ell}
+                       {\sum m_\ell}, \notag
+                       \label{eq:masked_mse_bco} \\
+  g_i &= \ell^\text{ref}_i - \ell^\theta_i. \notag 
+\end{align}
+Note the sign convention: $g_i > 0$ means the trainable model reconstructs
+the masked region \emph{better} than the reference (closer to $z_0$).
+For safe images, $g > 0$ is desirable---the policy should improve on the
+reference.
+For unsafe images, $g < 0$ is desirable---the policy should produce
+reconstructions \emph{further} from the policy-violating $z_0$.
+
+The mask weight $\lambda_m = 0.5$ applies $1.5\times$ gradient emphasis
+inside the adversarial region without completely ignoring the surrounding
+context.
+Ignoring the unmasked region entirely ($\lambda_m \to \infty$, i.e.\ masking
+the loss to the interior only) removes the coherence signal from the context
+border, producing visible seam artifacts at the mask boundary.
+
+\paragraph{Hinge cap on unsafe reward.}
+For unsafe samples ($y=0$), the reward is capped at:
+\begin{equation}
+  g_i \leftarrow \min\!\Big(g_i,\;
+    1.5 \cdot |\bar{g}_\text{unsafe}|_\text{detach}\Big), \notag
+  \label{eq:hinge_cap}
+\end{equation}
+where $\bar{g}_\text{unsafe}$ is the mean reward over unsafe samples in
+the current batch.
+Without this cap, the policy can exploit the mask by uniformly suppressing
+\emph{all} content inside it---a trivial maximisation of $-g$ that
+achieves a very negative reward (far from $z_0$) while producing visually
+incoherent output.
+The cap prevents the policy from exploiting arbitrarily large reward by
+bounding the unsafe reward at $1.5\times$ its own class mean,
+forcing it to find solutions that are both safe-suppressing \emph{and}
+spatially coherent.
+
+\subsubsection{Reward-Shift EMA and BCO Loss}
+
+To center the reward at the decision boundary between safe and unsafe
+classes, we maintain an exponential moving average:
+\begin{align}
+  \delta_\text{raw} &= \tfrac{1}{2}
+    \Big(\mathbb{E}[g | y{=}1] + \mathbb{E}[g | y{=}0]\Big), \notag
+    \label{eq:delta_raw} 
+\end{align}
+\[
+  \delta_\text{ema} \leftarrow
+    0.999\,\delta_\text{ema} + 0.001\,\delta_\text{raw}, \label{eq:delta_ema_1}
+\]
+\[
+  \quad \delta_\text{ema} \in [-0.03, +0.03]. \label{eq:delta_ema_2}
+\]
+
+\paragraph{Why the symmetric midpoint?}
+The shifted reward $r_i = g_i - \delta_\text{ema}$ should be positive for
+safe samples (the policy is better than baseline) and negative for unsafe
+samples (the policy is worse than baseline).
+The optimal centering point is the midpoint of the two class means, which is
+exactly $\delta_\text{raw}$.
+KTO's centering (\eqref{eq:kto_ema}) uses a safe-only EMA, which
+systematically underestimates the true decision boundary when $g$ differs
+across classes, miscalibrating the loss.
+
+The EMA clamp is applied \emph{in-place} to the stored EMA value before any downstream use:
+The $[-0.03, +0.03]$ bound is tighter and symmetric compared to KTO's $[-0.02, +0.05]$, preventing runaway baseline drift in either direction.
+
+\paragraph{BCO loss: softplus vs.\ sigmoid.}
+Given $r_i = g_i - \delta_\text{ema}$ and label sign
+$\text{sgn}_i = 2y_i - 1 \in \{-1, +1\}$, the per-sample BCO loss is:
+\begin{equation}
+\begin{aligned}
+  \ell^\text{BCO}_i = \mathrm{softplus}(-\,\text{sgn}_i \cdot \beta \cdot r_i)
+  \\= \log(1 + \exp(-\,\text{sgn}_i \cdot \beta \cdot r_i)). \notag
+  \label{eq:bco_loss}
+\end{aligned}
+\end{equation}
+
+\paragraph{Why softplus instead of KTO's $(1 - \sigma)$ loss?}
+Note that $\log \sigma(x) = -\text{softplus}(-x)$.
+The KTO per-sample loss $w_y(1 - h_i)$ with $h_i = \sigma(\cdot)$ is
+related to the negative log-likelihood $-\log \sigma(\cdot)$ but has a
+different gradient profile.
+
+\begin{enumerate}[leftmargin=1.5em,itemsep=2pt]
+  \item \textbf{Gradient saturation.}
+  $\partial(1-\sigma(x))/\partial x = -\sigma(x)(1-\sigma(x))$, which
+  collapses to zero as $x \to \pm\infty$.
+  $\partial\,\mathrm{softplus}(-x)/\partial x = -\sigma(-x) = -(1-\sigma(x))$,
+  which goes to $-1$ as $x \to +\infty$ and to $0$ as $x \to -\infty$.
+  Softplus maintains nonzero gradient on correctly classified, highly
+  confident samples, continuing to push them further from the boundary.
+  KTO's $(1-\sigma)$ loss provides a vanishing gradient once $h$ is large,
+  causing training to stall for well-separated samples while allowing
+  hard cases to drift.
+
+  \item \textbf{Probabilistic interpretation.}
+  Softplus is the numerically stable form of the binary cross-entropy
+  loss $-\log \sigma(\cdot)$, which is the maximum-likelihood loss for a
+  logistic classifier.
+  KTO's $(1-\sigma)$ loss lacks this clean probabilistic interpretation
+  and is less aligned with standard RL reward maximization intuition.
+
+  \item \textbf{Numerical stability.}
+  At $\beta=50$, the argument to the sigmoid can easily reach $|\beta r|
+  \sim 50 \times 0.5 = 25$, causing floating-point overflow in
+  $\exp(25) \approx 7 \times 10^{10}$.
+  PyTorch's \texttt{F.softplus} handles this via the numerically stable
+  formulation $\max(x, 0) + \log(1 + \exp(-|x|))$.
+\end{enumerate}
+
+The final BCO loss aggregates with per-class weights $w_y$:
+\begin{equation}
+\begin{aligned}
+    \mathcal{L}_\text{BCO} = \mathbb{E}_i\!\left[
+    w_y \cdot \mathrm{softplus}(-\,\text{sgn}_i \cdot \beta \cdot r_i)
+  \right], \\
+  \quad \beta = 50.
+  \notag
+  \label{eq:bco_loss_final} 
+\end{aligned}
+\end{equation}
+
+\subsubsection{Identity Guardrail: From Linear Penalty to Quadratic Hinge}
+
+\paragraph{The smudging problem.}
+An early linear identity penalty $\mathcal{L}_\text{id} =
+\|\hat{z}_0^\theta - \hat{z}_0^\text{ref}\|^2$ creates a continuous
+tradeoff: the policy can achieve low BCO loss (suppressing unsafe content)
+while staying near the reference (low identity loss) by \emph{smudging}
+pixels---slightly blurring or washing out the masked region rather than
+replacing it with coherent content.
+Smudging produces $\|\hat{z}_0^\theta - \hat{z}_0^\text{ref}\|^2 \approx
+0.01$--$0.03$, which is small enough to be tolerated by a linear penalty
+but large enough to visually destroy the image.
+
+\paragraph{The Quadratic Hinge.}
+The fix is a threshold that allows free exploration below a safe-smudging
+boundary and applies quadratic torque above it:
+\begin{align}
+  \ell_\text{id}(i) &=
+    \big(\|\hat{z}_0^\theta(i) - \hat{z}_0^\text{ref}(i)\|^2
+    - \kappa\big)_+^2, \quad \kappa = 0.02, 
+    \notag
+    \label{eq:id_hinge} \\
+  \mathcal{L}_\text{id} &= \mathbb{E}_i\!\left[
+    \bar{w}_i \cdot \ell_\text{id}(i)
+  \right],
+  \notag
+\end{align}
+where $\bar{w}_i = 30.0$ for safe samples and $\bar{w}_i = 5.0$ for unsafe .
+
+The hinge at $\kappa = 0.02$ is chosen based on empirical observation:
+below this threshold, the model is rendering coherent content (clothing,
+fabric texture, background elements); above it, the model is applying
+large-scale structural distortions including smudging.
+Below $\kappa$: \emph{zero penalty}---the model may freely render
+clothing, fabric, and background detail.
+Above $\kappa$: \emph{quadratic torque}---the penalty grows as the
+\emph{square} of the excess, making large distortions ($\ell_\text{id}
+\gg \kappa$) prohibitively expensive.
+A distortion of $\ell_\text{id} = 0.05$ incurs penalty $(0.05 - 0.02)^2
+= 9 \times 10^{-4}$, while $\ell_\text{id} = 0.10$ incurs
+$(0.10 - 0.02)^2 = 6.4 \times 10^{-3}$---a $7.1\times$ increase for a
+$2\times$ increase in distortion.
+
+\paragraph{Hinge applied per sample, not globally.}
+BCO applies hinge \emph{per sample} before aggregating.
+\begin{equation}
+  \text{KTO: } \mathcal{L}_\text{id}
+  = \Big(\mathbb{E}_i\!\left[\|\hat{z}_0^\theta - \hat{z}_0^\text{ref}\|^2\right]
+    - 0.02\Big)_+^2.
+    \notag
+\end{equation}
+With global aggregation, a single badly drifted sample inflates the mean,
+raising the penalty for all other samples and causing the optimizer to
+over-regularise the well-behaved ones.
+Per-sample hinging isolates the penalty to the drifted samples,
+maintaining a clean gradient for samples that are already rendering
+coherent content.
+
+\paragraph{Small weight for unsafe samples.}
+The identity loss is applied to unsafe samples at a reduced weight
+($\bar{w}_i = 5.0$ vs.\ $30.0$ for safe).
+This is deliberate: for unsafe samples, the policy \emph{should} diverge
+from the reference inside the mask (the reference produces NSFW content;
+the policy should not).
+However, the identity loss is applied across the full image ($\hat{z}_0$
+is full-resolution), so it also anchors the \emph{unmasked} background.
+The small weight preserves this background anchor---preventing suppression
+from bleeding into arms, hands, and context outside the mask---without
+blocking the policy from diverging on the masked region.
+
+\subsubsection{Reconstruction Anchor}
+
+The reconstruction loss anchors the unmasked background to the
+ground-truth noise:
+\begin{equation}
+  \mathcal{L}_\text{recon}
+  = \frac{\sum_i \bar{r}_i \cdot \|(\epsilon_\theta - \epsilon) \odot (1-m_\ell)\|^2_i}
+    {\sum_i \bar{r}_i},
+    \notag
+  \label{eq:recon_loss}
+\end{equation}
+where $\bar{r}_i = 200.0$ for safe samples and $\bar{r}_i = 0.0$ for
+unsafe.
+
+\paragraph{Why noise space, not $\hat{z}_0$ space?}
+The reconstruction loss operates in $\epsilon$-space rather than
+$\hat{z}_0$-space, because it targets the \emph{unmasked} region where the
+noise-schedule variance argument does not apply: at any timestep $t$, the
+noise prediction on an unmasked region should match the ground-truth
+noise $\epsilon$ regardless of $t$.
+Using $\hat{z}_0$ in the unmasked region would require dividing by
+$\sqrt{\bar\alpha_t}$, which amplifies errors at high $t$ and is
+unnecessary since we are not computing a preference signal here---only
+an anchor.
+
+\paragraph{Why zero weight for unsafe?}
+The policy should freely modify the unmasked background on unsafe samples
+only in the sense of preventing leakage from the masked region.
+Applying a strong reconstruction anchor to unsafe samples creates an
+objective conflict: the BCO loss pushes the mask region toward non-NSFW
+content, while the reconstruction loss would resist any structural change
+to the surrounding context.
+Zeroing the unsafe reconstruction weight removes this conflict, allowing the
+identity loss (at small weight) to provide the light background anchor.
+
+\paragraph{Normalized aggregation.}
+BCO uses a normalized weighted mean:
+$\mathcal{L}_\text{recon} = (\sum_i \bar{r}_i \ell_i) / (\sum_i \bar{r}_i)$.
+Since unsafe samples have $\bar{r}_i = 0$, the denominator equals the
+sum over safe samples only, making the result the mean reconstruction
+loss of safe samples.
+This is preferable to the KTO formulation of
+$\mathcal{L}_\text{recon} = 200.0 \times \text{mean}(\ell_i)$, which scales
+the raw mean (including near-zero unsafe contributions) by a large scalar,
+creating scale mismatch.
+Large fixed scalar multipliers are sensitive to learning rate choice and
+require careful tuning; normalized aggregation is robust to class imbalance.
+
+\subsubsection{Multi-Step DDIM Unrolling}
+
+At inference, the inpainter runs the full DDIM schedule starting
+from the scheduler's audited timestep.
+Single-step proxy training (predicting at one $t$) creates a distribution
+gap: the model is trained to minimize single-step $\hat{z}_0$ MSE, but
+evaluated on multi-step trajectories.
+
+Every 10 gradient steps, we augment the BCO loss with a second pass at
+a lower timestep.
+Given the current timestep $t$ and unrolling factor $K=10$:
+\begin{align}
+  \hat{z}_0^{(s)} &= \frac{z_{t_s} - \sqrt{1-\bar\alpha_{t_s}}\,
+    \epsilon_\theta(z_{t_s}, t_s)}{\sqrt{\bar\alpha_{t_s}}},
+    \notag\label{eq:ddim_z0} \\
+  z_{t_{s+1}} &= \sqrt{\bar\alpha_{t_{s+1}}}\,\hat{z}_0^{(s)}
+    + \sqrt{1-\bar\alpha_{t_{s+1}}}\,\epsilon_\theta(z_{t_s}, t_s),\notag
+\end{align}
+run for $K-1$ deterministic ($\eta=0$) DDIM steps under \texttt{no\_grad}
+to produce $z_\text{mid}$.
+We then re-noise: $z_{t_f} = \sqrt{\bar\alpha_{t_f}}\,z_\text{mid} +
+\sqrt{1-\bar\alpha_{t_f}}\,\epsilon'$, $t_f = \lfloor t/K \rfloor$,
+and compute a second BCO loss at $(z_{t_f}, t_f)$ under gradients.
+
+Both passes contribute equally (weight $0.5$ each) to the final gradient:
+\begin{equation}
+  \mathcal{L}_\text{BCO}^\text{total}
+  = 0.5\,\mathcal{L}_\text{BCO}^{(t)} + 0.5\,\mathcal{L}_\text{BCO}^{(t_f)}.
+  \notag
+\end{equation}
+To prevent holding two full UNet activation graphs in VRAM simultaneously,
+pass-1 backward is called before pass-2 forward.
+
+\subsubsection{Full Objective}
+
+\begin{equation}
+  \mathcal{L} = 4\,\mathcal{L}_\text{BCO} + \mathcal{L}_\text{recon}
+    + \mathcal{L}_\text{id}.
+    \notag
+  \label{eq:full_obj}
+\end{equation}
+The factor of $4$ on $\mathcal{L}_\text{BCO}$ was tuned empirically.
+The softplus loss with $\beta=50$ has magnitude
+$\sim\!\mathcal{O}(10^{-2}$--$10^{-1})$ at the decision boundary.
+The reconstruction and identity losses have magnitude
+$\sim\!\mathcal{O}(10^{-1}$--$10^{0})$ (noise-space MSE).
+The factor of $4$ brings the BCO signal into the same order of magnitude as
+the auxiliary losses, preventing them from dominating the gradient.
+
+Training batches are stratified: 8 safe / 4 nudity / 4 violence per batch
+of 16.
+Prompt dropout: 10\% per sample independently (reduced from the 30\%
+used in the later KTO experiments, as the BCO loss is less prone to
+cross-attention overfitting due to its spatial masking).
+
+
+% ─────────────────────────────────────────────────────────────────────────────
+% FIGURE PLACEHOLDER — Model weight activations at steps 500 / 1000 / 2500
+% ─────────────────────────────────────────────────────────────────────────────
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\linewidth]{latent-space-seperation.png}
+  \caption{
+    \textbf{The graph shows separation in the prompt trajectories in the latent space from high noise $t=700$ to low noise $t=5$ between red=`nudity', blue=`violence' and green=`safe' prompts for the policy-aware inpainter at step 0 and step 3000 of the BCO process for the attention module.}
+  }
+  \label{fig:activation_scatter}
+\end{figure*}
+
+%% ────────────────────────────────────────────────────────────────────────────
+\subsection{Failure Mode Archaeology}
+\label{app:failure_modes}
+%% ────────────────────────────────────────────────────────────────────────────
+
+Table~\ref{tab:failure_modes} documents the specific failure modes
+discovered across the different training runs, the diagnostic evidence that
+revealed them, and the architectural fix applied.
+
+\begin{table*}[!ht]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{p{2.6cm} p{3.6cm} p{3.8cm} p{4.0cm}}
+\toprule
+\textbf{Failure Mode} & \textbf{Symptom} & \textbf{Root Cause}
+  & \textbf{Fix Applied} \\
+\midrule
+Noise-space stochasticity (KTO Runs)
+  & $h_\text{safe} \approx h_\text{unsafe} \approx 0.500$
+    through step~500; no preference separation
+  & Preference gap $\mathcal{O}(10^{-2})$ overwhelmed by
+    high-$t$ noise variance $\mathcal{O}(10^{-1})$ in $\epsilon$-space;
+    SNR of gradient $< 1$
+  & Switch to BCO; reward computed on $\hat{z}_0$
+    (bounded, schedule-invariant) \\
+\addlinespace
+Off-manifold blue patches (KTO, vanilla)
+  & Model generates uniform blue fill inside mask;
+    image quality deteriorates outside mask
+  & Model hacks reward by leaving image manifold;
+    noise-space MSE is trivially minimized by off-manifold output
+  & Reconstruction + identity losses to anchor manifold \\
+\addlinespace
+Smudging / pixel destruction (KTO Runs and early BCO)
+  & Unsafe content obscured by blur/smear rather than
+    replaced; identity\_gap $\approx 0.035$
+  & Linear identity penalty creates continuous
+    trade-off; smudging is cheaper than rendering fabric
+  & Quadratic Hinge identity penalty with threshold $\kappa = 0.02$ \\
+\addlinespace
+Mask-conditioning breakage
+  & Model ignores mask; generates uniform texture across
+    full image
+  & Alignment gradients propagate into \texttt{conv\_in},
+    corrupting 9-channel conditioning logic
+  & Include \texttt{conv\_in} in LoRA adapter from SFT
+    stage; $\mathcal{L}_\text{recon}$ anchors unmasked context \\
+\addlinespace
+Sigmoid saturation
+  & \texttt{sigmoid\_sat\_pct} $> 90\%$ by step~1500;
+    softplus gradient near floor; training stalls
+  & $\beta{=}50$ with large reward gap pushes softplus
+    into saturation; expected behavior, not a bug
+  & Monitor $\Delta N$ for continued separation.
+    Saturation = binary decision boundary learned.
+    Reduce $\beta$ only if $\Delta N$ plateaus with
+    saturation. \\
+\addlinespace
+Cross-attention overfitting
+  & Safety behavior collapses when NSFW keywords present;
+    model keys on token patterns not visual features
+  & Cross-attention layers memorize token-safety
+    co-occurrence; spatial features unused
+  & 10\% prompt dropout; forces reliance on spatial
+    latent features for refusal triggering \\
+\addlinespace
+Reference contamination
+  & BCO validation set appears in training set;
+    cross-attention activations differ qualitatively
+    before and after manifold dip
+  & Qwen-2.5-VL captions produce near-identical text
+    for semantically similar images; dataset leakage
+  & Prompt dropout (secondary fix); data de-duplication
+    of validation set against training set \\
+\bottomrule
+\end{tabular}
+\caption{
+  Failure modes discovered across all training runs, their diagnostic
+  evidence, root causes, and the fixes applied.
+}
+\label{tab:failure_modes}
+\end{table*}
+
+%% ────────────────────────────────────────────────────────────────────────────
+\subsection{Training Dynamics and final Results}
+\label{app:training_dynamics}
+%% ────────────────────────────────────────────────────────────────────────────
+
+Figure (~\ref{fig:training_dynamics}) displays the final training run dynamics.
+
+\paragraph{Three-phase dynamics.}
+The final training run exhibits a characteristic three-phase training trajectory:
+
+\textbf{Phase 1 (steps 0--1000): SFT exploitation and smudging.}
+The model first uses the SFT prior to make modest progress ($\Delta N$
+rises to $0.222$), then transitions to pixel smudging as a cheaper
+optimization path.
+At step~1000, $h_U = 0.772 > h_S = 0.668$: the model has become
+``more confident'' on unsafe images than safe ones, a signature of the
+smudging attractor.
+The inverted gap indicates the model has found an incorrect local minimum.
+
+\textbf{Phase 2 (steps 1000--1500): Quadratic Hinge activation.}
+As smudging intensifies, $\|\hat{z}_0^\theta - \hat{z}_0^\text{ref}\|^2$
+crosses the hinge threshold $\kappa=0.02$.
+The identity loss now applies quadratic torque, making smudging
+prohibitively expensive.
+BCO simultaneously demands more unsafe suppression, and the $\hat{z}_0$
+anchor prevents structural distortion.
+The model backs off, causing $h$ values to temporarily equalize and $\Delta N$
+to plateau.
+This corresponds to the model searching the constrained manifold for a
+new optimization path.
+
+\textbf{Phase 3 (steps 1500--3000): Clothing discovery.}
+With smudging blocked and $\delta_\text{ema}$ clamped, the model is
+constrained to solutions that:
+(a) are safe-suppressing (low $g$ on unsafe images, satisfying BCO);
+(b) are spatially coherent (low identity loss, below hinge);
+(c) preserve background context (low reconstruction loss outside mask).
+The unique solution satisfying all three constraints is rendering coherent
+clothing or fabric over NSFW content.
+Clothing is structurally stable ($\ell_\text{id} < 0.02$), semantically
+safe (large $\Delta N$), and contextually coherent (low seam artifacts).
+By step~2000, $h_S = 0.918$, $\Delta N = 0.403$, and sigmoid saturation
+reaches $96.9\%$.
+
+\paragraph{Sigmoid saturation as a success criterion.}
+In standard diffusion training, sigmoid saturation ($> 90\%$) is a
+pathology indicating vanishing gradients.
+In BCO with $\beta=50$, it is the \emph{intended outcome}: the loss
+explicitly places the model into a binary regime.
+At $97\%$ saturation, the model has learned a near-hard classifier in
+$\hat{z}_0$-space: safe images are reconstructed better than the
+reference ($g > \delta$), unsafe images worse ($g < \delta$).
+The softplus loss maintains nonzero gradients even at saturation
+(unlike KTO's $(1-\sigma)$ loss), ensuring continued refinement rather
+than complete stall.
+The optimal checkpoint is around step~2000--2500; continued training
+past step~3000 shows slight $\Delta N$ degradation, likely due to
+over-fitting the BCO signal at the cost of generalization.
+
+% ─────────────────────────────────────────────────────────────────────────────
+% FIGURE PLACEHOLDER — Training dynamics
+% ─────────────────────────────────────────────────────────────────────────────
+\begin{figure*}[!ht]
+  \centering
+   \includegraphics[width=\linewidth]{bco-train-dynamics.png}
+  \caption{
+    \textbf{BCO training dynamics.}
+    \textit{Top:} $h_S$ (green), $h_U$ (red), and their gap (blue dashed)
+    over training steps, annotated with the three phases: SFT exploitation
+    and smudging (I), Quadratic Hinge activation (II), clothing discovery
+    (III).
+    \textit{Middle:} $\Delta N$ ($\hat{z}_0$-space MSE gap on unsafe samples)
+    showing the V-shape recovery after step~1500.
+    \textit{Bottom:} Sigmoid saturation \% showing the transition from
+    continuous to binary decision regime at step~1500.
+  }
+  \label{fig:training_dynamics}
+\end{figure*}
+
+\paragraph{Pre-computed dataset structure.}
+All training images are resized to $512\!\times\!512$ and pre-encoded
+through the SD~1.5 VAE to eliminate encoder forward passes during training.
+Each sample stores: $z_0$ (clean latent, $\mathbb{R}^{4\times64\times64}$),
+$m_\ell$ (latent mask, $\mathbb{R}^{1\times64\times64}$),
+$\tilde{z}_0$ (masked image latent), tokenized prompt \texttt{input\_ids}, and binary label $y \in \{0,1\}$..

@@ -1,0 +1,207 @@
+\section{Multi-Modal Adversarial Auditor Pipeline Architecture}
+\label{appendix:auditor_pipeline}
+
+\begin{figure*}[t]
+    \centering
+    \includegraphics[width=\linewidth]{auditor-inference.png}
+    \caption{
+        \textbf{Architecture diagram of the Auditor module.}
+    }
+    \label{fig:auditor_architecture}
+\end{figure*}
+
+This appendix provides a rigorous architectural and mathematical specification
+of the Adversarial Image Auditor pipeline. The pipeline integrates multi-task
+learning, cross-modal attention, and diffusion timestep conditioning via
+Feature-wise Linear Modulation (FiLM) to evaluate safety and structural
+integrity in generated images.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Complete Pipeline Flow and Spatial Dimensions}
+
+The system takes three distinct inputs: an image
+$X \in \mathbb{R}^{B \times 3 \times 224 \times 224}$, a tokenized prompt
+sequence $T \in \mathbb{R}^{B \times L}$ (where $L$ is the token sequence
+length), and a normalized diffusion timestep $t \in \mathbb{R}^{B \times 1}$.
+The primary data flow is formalised below.
+
+\begin{enumerate}[leftmargin=*, label=\textbf{\arabic*.}]
+
+\item \textbf{Visual Feature Extraction.}
+\begin{equation}
+\begin{aligned}
+    F_{\text{visual}} = \text{ResNet101}_{\text{backbone}}(X)
+    \;\in\; \\ \mathbb{R}^{B \times 2048 \times 7 \times 7} \notag
+\end{aligned}
+\end{equation}
+A global average-pooled vector is also computed: 
+\[
+\begin{aligned}
+f_{\text{global}} = \operatorname{AdaptiveAvgPool2d}(F_{\text{visual}}) \\ \in \mathbb{R}^{B \times 2048} \notag
+\end{aligned}
+\]
+
+\item \textbf{Textual Encoding.}
+\begin{equation}
+    f_{\text{text}},\; S_{\text{seq}},\; M_{\text{pad}}
+    = \text{BiLSTM}_{\text{encoder}}(T) \notag
+\end{equation}
+where $f_{\text{text}} \in \mathbb{R}^{B \times 512}$ is the global textual
+context, $S_{\text{seq}} \in \mathbb{R}^{B \times L \times 512}$ contains
+per-token sequence embeddings (pre-LayerNorm), and
+$M_{\text{pad}} \in \{0,1\}^{B \times L}$ is a boolean padding mask.
+
+\item \textbf{Prompt-to-Image Cross-Attention.}
+Visual feature maps are projected to the textual dimension, flattened, and
+normalised to form query vectors:
+\begin{equation}
+\begin{aligned}
+    Q = \operatorname{LayerNorm}\!\bigl(\operatorname{Conv2d}_{1\times1}(F_{\text{visual}})\bigr) \\
+    \;\in\; \mathbb{R}^{B \times 49 \times 512} \notag
+\end{aligned}
+\end{equation}
+\begin{equation}
+    K = V = \operatorname{LayerNorm}(S_{\text{seq}})
+    \;\in\; \mathbb{R}^{B \times L \times 512} \notag
+\end{equation}
+Multi-head cross-attention yields prompt-conditioned visual representations:
+\begin{equation}
+\begin{aligned}
+    A_{\text{attended}}
+    = \operatorname{MultiHeadAttention}(Q,\,K,\,V;\; \\ \text{mask}=M_{\text{pad}})
+    \;\in\; \mathbb{R}^{B \times 49 \times 512} \notag
+\end{aligned}
+\end{equation}
+Spatial averaging gives $f_{\text{attended}} \in \mathbb{R}^{B \times 512}$,
+which is used exclusively by the CLIP-style alignment head (Section~B.3).
+
+\end{enumerate}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Timestep-Aware FiLM Conditioning}
+
+Adversarial noise patterns manifest differently depending on the denoising
+timestep $t \in [0,1]$.  A multi-layer perceptron maps $t$ to a shared
+temporal embedding:
+\begin{equation}
+    e_{t} = \operatorname{MLP}_{\text{timestep}}(t)
+    \;\in\; \mathbb{R}^{B \times 512} \notag
+\end{equation}
+
+This embedding drives two \emph{independent} FiLM projections with separate
+learned weights --- one for adversary modulation and one for seam modulation.
+Each projection produces scale $\gamma$ and shift $\beta$ coefficients for
+Feature-wise Linear Modulation.
+
+\begin{enumerate}[leftmargin=*, label=\textbf{\arabic*.}]
+
+\item \textbf{Relative Adversary Modulation.}
+The \emph{relative adversary score} quantifies the continuous perturbation
+strength of an image on a $[0,1]$ scale (see Section~B.3).  To condition its
+prediction on the timestep, we modulate the global pooled features:
+\begin{equation}
+\begin{aligned}
+     \gamma_{\text{adv}},\;\beta_{\text{adv}}
+    = \operatorname{Split}\!\bigl(\operatorname{Linear}_{\text{film,adv}}(e_t)\bigr) \\
+    \;\in\; \mathbb{R}^{B \times 2048} \notag
+    \end{aligned}
+\end{equation}    
+
+\begin{equation}
+    f_{\text{global}}^{\text{mod}}
+    = (1 + \gamma_{\text{adv}}) \odot f_{\text{global}} + \beta_{\text{adv}} \notag
+\end{equation}
+Here $\operatorname{Linear}_{\text{film,adv}} : \mathbb{R}^{512} \to
+\mathbb{R}^{4096}$, and $\operatorname{Split}$ divides the output equally along
+the last dimension.
+
+\item \textbf{Seam Quality Modulation.}
+A separate projection conditions the intermediate convolutional features
+$F_{\text{seam}} \in \mathbb{R}^{B \times 512 \times 7 \times 7}$ used for
+structural artefact detection:
+\begin{equation}
+\begin{aligned}
+    \gamma_{\text{seam}},\;\beta_{\text{seam}}
+    = \operatorname{Split}\!\bigl(\operatorname{Linear}_{\text{film,seam}}(e_t)\bigr) \\
+    \;\in\; \mathbb{R}^{B \times 512} \notag
+\end{aligned}
+\end{equation}
+\begin{equation}
+    F_{\text{seam}}^{\text{mod}}
+    = \bigl(1 + \gamma_{\text{seam}}^{\phantom{A}}\bigr) \odot F_{\text{seam}}
+      + \beta_{\text{seam}} \notag
+\end{equation}
+where $\gamma_{\text{seam}}$ and $\beta_{\text{seam}}$ are broadcast over the
+spatial dimensions.  Note that $\operatorname{Linear}_{\text{film,seam}}$ maps
+$\mathbb{R}^{512} \to \mathbb{R}^{1024}$ and has no shared weights with
+$\operatorname{Linear}_{\text{film,adv}}$.
+
+\end{enumerate}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{Specialised Multi-Task Auditor Heads}
+
+The auditor decouples distinct tasks into dedicated prediction heads to ensure
+stable gradient flow and to protect alignment encodings from direct safety-label
+contamination.
+
+\begin{itemize}[leftmargin=*]
+
+\item \textbf{Binary Adversarial Head.}
+Computes $P(\text{Adversarial} \mid X)$ directly from the \emph{unmodulated}
+spatial features $F_{\text{visual}}$ via a $1{\times}1$ convolution, adaptive
+global average pooling, and Sigmoid activation.  This head intentionally
+bypasses FiLM conditioning so that the binary decision is not conflated with
+timestep dynamics.
+
+\item \textbf{Safety Category Head.}
+Projects $F_{\text{visual}}$ to $C=3$ channels and applies cost-sensitive
+cross-entropy with class weights $w = [1.0,\,5.0,\,2.0]$.  The elevated weight
+for class~1 (adversarial) reflects its underrepresentation in the training
+distribution; the moderate weight for class~2 (borderline) penalises
+ambiguous predictions more than the majority safe class.
+
+\item \textbf{Relative Adversary Score Head.}
+Regresses the continuous perturbation strength $s \in [0,1]$ from the
+FiLM-modulated vector $f_{\text{global}}^{\text{mod}}$ using a three-layer MLP
+with dropout.  Unlike the binary head, this head is conditioned on the timestep
+embedding to capture how perturbation magnitude varies across denoising stages.
+
+\item \textbf{Seam Quality Assessment Head.}
+Evaluates inpainting seams and composite boundaries by applying a regression
+head to $F_{\text{seam}}^{\text{mod}}$, yielding a localised artefact score.
+
+\item \textbf{CLIP-style Faithfulness Alignment Head.}
+Projects $f_{\text{attended}}$ and $f_{\text{text}}$ independently into a
+shared latent space $\mathbb{R}^{256}$ using separate two-layer MLPs, then
+optimises image--prompt alignment via symmetric InfoNCE loss with a learnable
+log-temperature $\tau$.  Both the cross-attended visual vector and the raw
+global text vector $f_{\text{text}}$ are fed to this head to preserve low-level
+lexical grounding alongside spatially-attended semantics.
+
+\end{itemize}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\subsection{GradCAM Explainability Pipeline}
+
+For visual explainability, target activations are extracted from the final
+residual convolutional layer of the ResNet101 backbone.  The localised risk
+heatmap $M_{\text{risk}} \in \mathbb{R}^{7 \times 7}$ for safety class $c$ is:
+\begin{equation}
+    M_{\text{risk}}
+    = \operatorname{ReLU}\!\left(\sum_{k} \alpha_k^c \cdot F_{\text{visual},k}\right) \notag
+\end{equation}
+where the importance weights $\alpha_k^c$ are obtained by global average
+pooling of the backpropagated gradients:
+\begin{equation}
+    \alpha_k^c
+    = \operatorname{AdaptiveAvgPool2d}\!\left(
+        \frac{\partial\, y^c}{\partial\, F_{\text{visual},k}}
+      \right) \notag
+\end{equation}
+The resulting maps are bilinearly upsampled to $224{\times}224$ and
+alpha-blended onto the source image using custom contour overlays to localise
+flagged regions.  Because GradCAM operates directly on $F_{\text{visual}}$, it
+provides explanations that are independent of FiLM conditioning, giving an
+unbiased view of which image regions drive the safety classification.
+

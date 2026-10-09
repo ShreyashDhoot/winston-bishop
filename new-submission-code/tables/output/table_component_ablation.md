@@ -6,4 +6,4 @@
 | SFT-Only Inpainter (No BCO) | Preference Optimization | 14.2% | 82.0% | 4.65 | 6.1s |
 | Tournament Disabled (First Candidate) | Utility Tournament | 16.8% | 79.4% | 4.52 | 4.2s |
 | Random-Knob Tournament (Uniform Sampling) | TSPO Policy Network | 11.5% | 84.2% | 4.88 | 6.2s |
-| \textbf{Full GuardPaint (Proposed)} | Complete System | \textbf{7.4\%} | \textbf{86.8\%} | \textbf{5.06} | 6.2s |
+| \textbf{Full GuardPaint (Proposed)} | Complete System | 7.4% | 86.8% | 5.06 | 6.2s |

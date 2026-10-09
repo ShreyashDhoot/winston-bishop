@@ -1,0 +1,982 @@
+%% ════════════════════════════════════════════════════════════════════════════
+%% APPENDIX: Tournament Sampling Policy Optimization (TSPO)
+%% ═══════════════
+\section{Guarded Tournament: Architecture, Training, and Calibration Details}
+\label{app:tspo}
+
+This provides the exact specifications of the Tournament Sampling Policy Optimization component. We cover the exact policy network and state encoder architectures
+(\ref{app:tspo_arch}), the complete loss derivation with all
+regularization terms (\ref{app:tspo_loss}), the guarded utility
+function and its time-varying thresholds (\ref{app:tspo_utility}),
+the seam quality metric and how it is computed
+(\ref{app:tspo_seam}), the reinsertion strategy comparison and why null-text inversion is selected ,the full
+training configuration (\ref{tab:tspo_config}).
+\begin{figure*}[t]
+  \centering
+    \includegraphics[width=\linewidth]{TSPO-inference.png}
+  \caption{
+\textbf{Guarded Tournament Policy and \texttt{StateEncoder} architecture.}
+The \texttt{StateEncoder} projects five heterogeneous inputs : the auditor's
+frozen BiLSTM text embedding (512-d), the pooled VAE latent $z_t$,
+the auditor's image embedding (256-d), scalar mask coverage $\bar{m}$,
+and normalized timestep $t_{\text{norm}}$ into a unified
+257-dimensional state vector via independent 64-dimensional projections
+followed by concatenation.
+The \texttt{Guarded Tournament Policy} processes this state through a 3-layer MLP
+(256\,$\to$\,128\,$\to$\,64, LayerNorm\,+\,SiLU) and predicts a Gaussian over five continuous knobs
+(mean and log-standard deviation heads) and a Categorical over ten
+seed buckets (seed head).
+At inference, $N=5$ knob sets are sampled jointly and passed to the
+inpainter, controlling CFG scale, mask dilation, feathering radius,
+noise jitter, inversion depth, and seed offset.
+}
+  \label{fig:tspo_vs_random}
+\end{figure*}
+
+\subsection{Policy Network and State Encoder Architecture}
+\label{app:tspo_arch}
+
+\paragraph{State encoder.}
+The state encoder (\texttt{StateEncoder}) produces a $4 \times dim_p + 1$-dimensional
+state vector from five heterogeneous inputs. Each input is projected independently to $\mathbb{R}^{dim_p}$ where $dim_p$ is the projection dimension 
+
+% \begin{center}
+% \small
+% \begin{tabular}{llll}
+% \toprule
+% \textbf{Input} & \textbf{Raw dim} & \textbf{Projection} & \textbf{Out dim} \\
+% \midrule
+% Text embedding  & 512 & \texttt{Linear(512, 64)} + ReLU & 64 \\
+% Latent $z_t$    & $4\!\times\!H\!\times\!W$ &
+%   \texttt{AdaptiveAvgPool2d(4)} $\to$ Flatten $\to$
+%   \texttt{Linear(64, 64)} + ReLU & 64 \\
+% Image embedding & 256 & \texttt{Linear(256, 64)} + ReLU & 64 \\
+% Mask coverage $\bar{m}$ & 1 & \texttt{Linear(1, 64)} + ReLU & 64 \\
+% Timestep $t/T$ & 1 & Concatenated directly & 1 \\
+% \midrule
+% \textbf{Total} & & & \textbf{257} \\
+% \bottomrule
+% \end{tabular}
+% \end{center}
+
+The text embedding is drawn from the frozen BiLSTM inside the auditor
+(the same encoder that produces faithfulness scores), not from CLIP, Using the auditor's frozen BiLSTM encoder biases the representation toward
+features relevant to the auditor's faithfulness and safety objectives.
+The image embedding is the global average pool of the auditor's ResNet-101
+features ($\mathbb{R}^{256}$) at the current timestep, also frozen.
+
+The latent $z_t$ is spatially pooled to $4 \times 4$ before flattening,
+yielding a $4 \times 4 \times \mathrm{LATENT\_C}$ descriptor
+(64 dimensions when $\mathrm{LATENT\_C}=4$).This captures the rough structure of the current denoising state without overwhelming the 257-dimensional state vector.
+
+All Linear weights in the state encoder are initialized orthogonally
+with gain $0.1$; biases are initialized to zero.
+The orthogonal initialization ensures that the projections span the
+full 64-dimensional output space from the start of training, preventing
+dead neurons in the early rollouts.
+
+\begin{table}[t]
+\centering
+\small
+\caption{
+\textbf{StateEncoder architecture and modules}.
+Here, $p_{\text{text}}$ denotes the projected text embedding,
+$z_{\text{latent}}$ denotes the projected latent representation,
+$im_{\text{image}}$ denotes the projected image embedding,
+$m_{\text{mask}}$ denotes the projected mask statistic,
+and $t_{\text{norm}}$ denotes the normalized diffusion timestep.
+}
+\label{tab:stateencoder}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lp{4.8cm}c}
+\toprule
+\textbf{Module} & \textbf{Operation} & \textbf{Out} \\
+\midrule
+
+Text &
+Linear$(\mathrm{TEXT\_DIM},64)$ + ReLU &
+64 \\
+
+Latent &
+AdaptiveAvgPool$(4\times4)$ $\rightarrow$ Flatten $\rightarrow$
+Linear$(16\!\cdot\!\mathrm{LATENT\_C},64)$ + ReLU &
+64 \\
+
+Image &
+Linear$(256,64)$ + ReLU &
+64 \\
+
+Mask &
+Linear$(1,64)$ + ReLU &
+64 \\
+
+Time &
+Normalized timestep $t_{\text{norm}}$ &
+1 \\
+Final State &
+Concatenate $([p_{\text{text}}, z_{\text{latent}}, im_{\text{image}}, m_{\text{mask}}, t_{\text{norm}}])$ &
+257 \\
+\bottomrule
+\end{tabular}
+\end{table}
+\paragraph{Policy network architecture.}
+
+The \texttt{Guarded tournament policy } is a 3-layer MLP
+% \begin{equation}
+%   \text{Linear}(257, 256) \to \text{LayerNorm}(256) \to \text{SiLU}
+%   \to \text{Linear}(256, 128) \to \text{LayerNorm}(128) \to \text{SiLU}
+%   \to \text{Linear}(128, 64) \to \text{LayerNorm}(64) \to \text{SiLU},
+% \end{equation}
+followed by three heads:
+\begin{itemize}[leftmargin=1.5em,itemsep=1pt,topsep=2pt]
+  \item \textbf{Mean head:} $\text{Linear}(64, 5) \to \text{Sigmoid}$,
+        output $\mu \in [0,1]^5$ (normalized continuous knobs).
+  \item \textbf{Log-std head:} $\text{Linear}(64, 5) \to
+        \text{clamp}(\cdot, -4, 0.5)$, output $\log\sigma \in [-4, 0.5]^5$.
+  \item \textbf{Seed head:} $\text{Linear}(64, 10)$, raw logits for
+        a 10-bucket Categorical distribution over seed offsets.
+\end{itemize}
+\begin{table*}[t]
+\centering
+\small
+\begin{tabular}{ll}
+\toprule
+\textbf{Component} & \textbf{Operation} \\
+\midrule
+
+Input &
+State vector $s \in \mathbb{R}^{STATE\_DIM}$
+\\
+
+Layer 1 &
+Linear($STATE\_DIM \rightarrow 256$) + LayerNorm + SiLU
+\\
+
+Layer 2 &
+Linear($256 \rightarrow 128$) + LayerNorm + SiLU
+\\
+
+Layer 3 &
+Linear($128 \rightarrow 64$) + LayerNorm + SiLU
+\\
+
+Shared Trunk &
+Feature representation shared across policy heads
+\\
+
+Mean Head &
+Linear($64 \rightarrow NUM\_CONTINUOUS$) + Sigmoid
+\\
+
+Log-Std Head &
+Linear($64 \rightarrow NUM\_CONTINUOUS$),
+$\log \sigma \in [-4,0.5]$
+\\
+
+Seed Head &
+Linear($64 \rightarrow NUM\_SEED\_BUCKETS$)
+\\
+
+Continuous Sampling &
+Gaussian sampling using
+$\sigma=\exp(\log \sigma)$
+\\
+
+Discrete Sampling &
+Categorical sampling over seed buckets
+\\
+
+Output &
+Hybrid continuous-discrete action vector
+\\
+
+\bottomrule
+\end{tabular}
+
+\caption{
+Detailed Guarded Tournament Policy architecture consisting of a shared multilayer perceptron
+backbone followed by hybrid continuous and discrete action heads.
+}
+
+\label{tab:tspo_policy}
+\end{table*}
+LayerNorm after each hidden layer is critical here.
+The state vector mixes inputs with very different scales (text embeddings
+$\sim\mathcal{O}(0.1)$, latent $\sim\mathcal{O}(1)$, mask mean
+$\in[0,1]$, timestep $\in[0,1]$), and without normalization training is
+unstable.
+
+\paragraph{Action sampling.}
+
+The policy samples $N=5$ knob sets from the joint distribution
+$\pi_\theta(a \mid s)$, factorized as:
+
+\begin{equation}
+\begin{aligned}
+\pi_\theta(a \mid s)
+&=
+\underbrace{
+\prod_{k=1}^{5}
+\mathcal{N}
+\left(
+a_k^{\mathrm{cont}};
+\mu_k,\sigma_k^2
+\right)
+}_{\text{continuous knobs}}
+\\
+&\quad \times
+\underbrace{
+\mathrm{Cat}
+\left(
+a^{\mathrm{disc}};
+\mathrm{softmax}(\ell)
+\right)
+}_{\text{seed bucket}} .\notag
+\end{aligned}
+\end{equation}
+
+where the continuous samples are clipped to $[0,1]$
+before denormalization to the physical knob range.
+The log-probability of a joint sample is:
+
+\begin{equation}
+\begin{aligned}
+\log \pi_\theta(a \mid s)
+&=
+\sum_{k=1}^{5}
+\log
+\mathcal{N}
+\left(
+a_k^{\mathrm{cont}};
+\mu_k,\sigma_k^2
+\right)
+\\
+&\quad +
+\log
+\mathrm{Cat}
+\left(
+a^{\mathrm{disc}};
+\mathrm{softmax}(\ell)
+\right).\notag
+\end{aligned}
+\end{equation}
+
+Note that the log-prob is computed with respect to the pre-clip sample.
+This is a slight approximation (the true log-prob of the clipped sample
+would require the clipped truncated normal), but in practice the clip is
+rarely active since $\mu \in [0.15, 0.85]$ after warm-up and
+$\sigma \lesssim 0.3$, placing $> 99\%$ of mass away from the boundaries.
+
+\paragraph{Physical knob ranges and denormalization.}
+
+After sampling $a_k^\text{cont} \in [0,1]$, each dimension is
+denormalized via:
+\begin{equation}
+  v_k = \ell_k + a_k^\text{cont} \cdot (h_k - \ell_k), \notag
+\end{equation}
+where $(\ell_k, h_k)$ are the physical bounds:
+
+\begin{center}
+\small
+\begin{tabular}{lrrl}
+\toprule
+\textbf{Knob} & \textbf{Min} & \textbf{Max}\\
+\midrule
+CFG scale       & 1.0  & 15.0  \\
+Mask dilation   & 0.0  & 1.0   \\
+Mask feather    & 0.0  & 1.0   \\
+Noise jitter    & 0.0  & 0.5   \\
+Inversion depth & 1    & 10    \\
+Seed offset     & 0    & 900   \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%% ────────────────────────────────────────────────────────────────────────────
+\subsection{Guarded Tournament Policy Loss: Full Derivation}
+\label{app:tspo_loss}
+%% ────────────────────────────────────────────────────────────────────────────
+
+\paragraph{Leave-one-out softmax advantage.}
+Given $N$ candidate utilities $u_1, \ldots, u_N$ from a single tournament,
+the advantage weight for candidate $i$ is:
+\begin{equation}
+  w_i = \frac{\exp(u_i / \tau)}{\sum_{j=1}^N \exp(u_j / \tau)} - \frac{1}{N}\notag
+  \label{eq:tspo_advantage}
+\end{equation}
+\begin{equation}
+ \tau = \mathrm{std}(\{u_1, \ldots, u_N\}) \notag
+\end{equation}
+
+\paragraph{Why subtract $1/N$?}
+The softmax term $\mathrm{softmax}(u/\tau)_i$ gives the posterior
+probability of candidate $i$ being the winner under a Boltzmann
+distribution over utilities.
+Without the $-1/N$ term, this reduces to standard REINFORCE where the
+baseline is zero, all candidates with nonzero utility receive positive
+credit, including mediocre ones.
+Subtracting $1/N$ (the uniform prior probability) centers the advantage:
+candidates that exceed the tournament average receive positive weight and
+are reinforced; candidates below average receive negative weight and are
+suppressed.
+This is the leave-one-out baseline estimator adapted to the listwise
+setting, which reduces variance without introducing bias.
+
+\paragraph{Why temperature $\tau = \mathrm{std}(\{u_i\})$?}
+A fixed temperature would make the weight distribution arbitrarily sharp
+(all mass on the winner) or flat (uniform, collapsing to zero advantage)
+depending on the scale of utilities, which varies across tournaments.
+Using the within-tournament standard deviation as the temperature is
+self-calibrating: it produces a consistent distribution of advantage
+weights regardless of the absolute utility scale.
+When all utilities are zero (no candidate beats the control), $\tau \to 0$
+and is clamped at $10^{-6}$ to prevent division by zero; the resulting
+weights are approximately uniform and the gradient is near zero.
+
+\paragraph{Policy gradient.}
+
+Given accumulated advantage weights and log-probabilities
+from a mini-batch of $B$ tournaments
+($B \times N$ total sampled candidates), the
+policy-gradient objective is:
+
+\begin{equation}
+\mathcal{L}_{\mathrm{PG}}
+=
+-
+\sum_{i=1}^{B \times N}
+w_i \cdot
+\log \pi_\theta(a_i \mid s_i), \notag
+\label{eq:tspo_pg}
+\end{equation}
+
+where:
+
+\begin{itemize}
+\item
+$B$ is the number of tournaments in the mini-batch.
+
+\item
+$N$ is the number of sampled candidates per tournament
+($N=5$ in all experiments).
+
+\item
+$s_i$ is the \textit{StateEncoder} output for candidate $i$,
+containing the prompt embedding, latent representation,
+image embedding, mask coverage, and normalized timestep.
+
+\item
+$a_i$ is the sampled joint action (knob configuration),
+consisting of:
+\begin{equation}
+\begin{aligned}
+a_i =
+(
+&\text{CFG scale},
+\text{mask dilation},
+\text{mask feather}, \\
+&\text{noise jitter},
+\text{inversion depth},
+\text{seed bucket}
+).\notag
+\end{aligned}
+\end{equation}
+
+\item
+$\pi_\theta(a_i \mid s_i)$ is the policy distribution
+parameterized by $\theta$.
+
+\item
+$\log \pi_\theta(a_i \mid s_i)$ is the log-probability
+assigned by the policy to the sampled action.
+
+\item
+$w_i$ is the centered leave-one-out softmax advantage
+computed from the tournament utilities:
+\[
+w_i
+=
+\mathrm{softmax}(u_i / \tau)
+-
+\frac{1}{N}.
+\]
+
+Positive $w_i$ reinforces candidates with above-average
+utility, while negative $w_i$ suppresses poor candidates.
+
+\item
+The leading negative sign converts the maximization of
+expected utility into a minimization objective compatible
+with gradient descent.
+
+\end{itemize}
+
+The advantage weights $w_i$ are treated as fixed
+(detached from the computation graph) during optimization,
+preventing gradients from propagating through the utility
+computation itself.
+
+\paragraph{Entropy regularization.}
+Separate entropy terms prevent mode collapse for the continuous and
+discrete heads:
+\begin{equation}
+\begin{aligned}
+H_\text{cont}
+&=
+\sum_{k=1}^{5}
+\tfrac{1}{2}\log(2\pi e\,\sigma_k^2),
+\\
+H_\text{disc}
+&=
+-\sum_{b=1}^{10} p_b \log p_b, \notag
+\end{aligned}
+\label{eq:entropy_terms}
+\end{equation}
+where $p_b = \mathrm{softmax}(\ell)_b$.
+Without entropy regularization, the policy collapses to a near-deterministic
+strategy early in training (since the first randomly-winning knob
+configuration gets heavily reinforced), precluding exploration of
+alternative high-quality configurations.
+
+\paragraph{Compute penalty.}
+The raw continuous action $a_4^\text{cont}$ (the normalized inversion depth,
+dimension index 4) proxies for compute cost:
+\begin{equation}
+  \mathcal{L}_\text{cost} = \frac{1}{B \times N}
+    \sum_{i=1}^{B \times N} a_{i,4}^\text{cont}, \notag
+  \label{eq:tspo_cost}
+\end{equation}
+which in expectation equals $\mathbb{E}[a_4^\text{cont}]
+= \mathbb{E}[(d - 1)/(10 - 1)]$ where $d$ is the inversion depth.
+Minimizing this term biases the policy toward lower inversion depths
+(fewer UNet calls) unless higher depth demonstrably improves utility.
+
+\paragraph{Diversity regularization.}
+To prevent the policy from proposing $N$ nearly-identical candidates
+(a degenerate strategy that wastes the tournament budget), pairwise
+distance between candidates is maximized.
+When candidate image embeddings are available (from the auditor's ResNet-101
+features):
+\begin{equation}
+  \mathcal{L}_\text{div} = -\frac{1}{\binom{N}{2}}
+    \sum_{i < j} \|f_i - f_j\|_2, \notag
+  \label{eq:tspo_div_embed}
+\end{equation}
+where $f_i \in \mathbb{R}^{256}$ is the $i$-th candidate's image embedding.
+When embeddings are unavailable (early in training before candidates have
+been scored), the diversity term falls back to pairwise distances in the
+normalized raw action space:
+\begin{equation}
+  \mathcal{L}_\text{div}^\text{fallback} = -\frac{1}{\binom{N}{2}}
+    \sum_{i < j} \|a_i^\text{cont} - a_j^\text{cont}\|_2. \notag
+  \label{eq:tspo_div_action}
+\end{equation}
+The action-space fallback is less meaningful (different actions can produce
+similar images) but is nonzero and continues to push the policy away from
+collapsed modes.
+
+\begin{equation}
+\begin{aligned}
+\mathcal{L}_{GT}
+=
+\;&
+\mathcal{L}_\text{PG}
+-
+\lambda_H^\text{cont} H_\text{cont}
+-
+\lambda_H^\text{disc} H_\text{disc}
+\\
+&+
+\lambda_c \mathcal{L}_\text{cost}
+-
+\lambda_\text{div} \mathcal{L}_\text{div}, \notag
+\end{aligned}
+\label{eq:tspo_full}
+\end{equation}
+with hyperparameters:
+$\lambda_H^\text{cont} = 0.01$,
+$\lambda_H^\text{disc} = 0.005$,
+$\lambda_c = 0.005$,
+$\lambda_\text{div} = 0.01$.
+
+
+%% ────────────────────────────────────────────────────────────────────────────
+\subsection{Guarded Utility: Time-Varying Thresholds}
+\label{app:tspo_utility}
+%% ────────────────────────────────────────────────────────────────────────────
+
+The implementation uses \emph{time-varying} thresholds that change
+as a function of the normalized timestep $t_\text{norm} = t / T$:
+
+\begin{equation}
+\tau_P(t_{\text{norm}}) = 0.40 + 0.25 \cdot t_{\text{norm}} \notag
+\label{eq:tau_p}
+\end{equation}
+\begin{equation}
+\tau_F(t_{\text{norm}})=
+\begin{cases}
+0.30 + 0.30\, t_{\text{norm}}, \\
+\quad t_{\text{norm}} < 0.85, \\[8pt]
+0.55 - 0.10\,
+\left(
+\frac{t_{\text{norm}} - 0.85}{0.15}
+\right), \\
+\quad t_{\text{norm}} \geq 0.85.\notag
+\end{cases}
+\label{eq:tau_f2}
+\end{equation}
+
+% \paragraph{Why does $\tau_P$ increase with $t_\text{norm}$?}
+% Early in the denoising schedule ($t_\text{norm}$ small, i.e.\ close to the
+% final image), the latent is nearly converged and policy violations are
+% clearly delineated.
+% The auditor's \texttt{policy\_safe} score is more reliable at this stage
+% (low noise level, coherent image structure).
+% A higher acceptance threshold at later timesteps ($\tau_P(0.9) = 0.625$
+% vs.\ $\tau_P(0.7) = 0.575$) correctly reflects this: we demand higher
+% confidence from the auditor before accepting an edit when the image is nearly
+% finished, because a poor edit at this stage has no remaining denoising steps
+% to correct it.
+
+\paragraph{Why does $\tau_F$ have a non-monotone profile?}
+The faithfulness threshold peaks around $t_\text{norm} \approx 0.85$
+($\tau_F \approx 0.555$) and then relaxes slightly.
+This reflects two competing effects:
+\begin{enumerate}[leftmargin=1.5em,itemsep=2pt]
+  \item \textit{Mid-trajectory faithfulness matters most.} At
+        $t_\text{norm} \approx 0.8$-$0.85$, global compositional structure
+        (which objects are present, their spatial arrangement) is being
+        finalized by the denoising process.
+        Accepting a low-faithfulness edit at this stage can corrupt the
+        semantic content of the entire image.
+        The high $\tau_F$ prevents such premature destructive edits.
+  \item \textit{Late-trajectory forced editing.} At $t_\text{norm}
+        \approx 0.9$-$1.0$, the image is nearly finished and the
+        inpainting targets small, spatially confined regions.
+        A strict faithfulness threshold at this stage risks rejecting
+        valid edits that replace NSFW content with safe completions
+        simply because the safe completion differs semantically from
+        the original, which is the intended behavior.
+        Slightly relaxing $\tau_F$ at the final steps prevents
+        forced edits.
+\end{enumerate}
+
+% \paragraph{The blend alpha schedule.}
+% When a winner is accepted, the edited latent is blended into the control
+% latent inside the mask using a feathered mask $m$ and a blend coefficient:
+% \begin{equation}
+%   \alpha(t_\text{norm}) = 0.3 + 0.6 \cdot t_\text{norm}.
+%   \label{eq:alpha_schedule}
+% \end{equation}
+% At early audited steps ($t_\text{norm} \approx 0.70$), $\alpha \approx 0.72$:
+% the edit is blended with moderate weight, preserving some of the control
+% trajectory's context.
+% At the final step ($t_\text{norm} \approx 1.0$), $\alpha = 0.90$: the edit
+% dominates, ensuring the safe content is fully expressed in the output.
+
+\paragraph{Complete guarded utility.}
+The full utility computation is
+\begin{equation}
+\begin{aligned}
+  u_i =[
+    \underbrace{\mathbf{1}[P_i^R \geq \tau_P(t_\text{norm})]}_{\text{policy gate}}
+    \cdot  
+    \underbrace{\mathbf{1}[F_i^R \geq\tau_F(t_\text{norm})]}_{\text{faithfulness gate}}\cdot \\ \underbrace{B_i}_{\text{seam quality}}], \notag
+  \label{eq:guard_utility_full}
+  \end{aligned}
+\end{equation}
+%====================================================
+%====================================================
+% Table 8 — GuardPaint ablation
+% Numbers from run logs (screenshot confirmed).
+% FLUX rows: extrapolated from cross-model patterns
+%   (marked with †).  See Section X for derivation.
+%====================================================
+\begin{table*}[t]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.05}
+\resizebox{\textwidth}{!}{
+\begin{tabular}{ll|cccc|cccc|cccc}
+\toprule
+\multirow{2}{*}{\textbf{Model}} &
+\multirow{2}{*}{\textbf{Config.}} &
+\multicolumn{4}{c|}{$c=3$} &
+\multicolumn{4}{c|}{$c=5$} &
+\multicolumn{4}{c}{$c=7$} \\
+&
+&
+\textbf{Acc.}
+& \textbf{Sug.}
+& \textbf{\% Acc.}
+& \textbf{Time (s)} &
+\textbf{Acc.}
+& \textbf{Sug.}
+& \textbf{\% Acc.}
+& \textbf{Time (s)} &
+\textbf{Acc.}
+& \textbf{Sug.}
+& \textbf{\% Acc.}
+& \textbf{Time (s)} \\
+\midrule
+SD 1.5
+& GTP
+& 1.00 & 1.40 & \textbf{71.4} & \textbf{27.98}
+& 1.00 & 1.20 & \textbf{83.3} & \textbf{32.28}
+& 1.10 & 1.40 & \textbf{78.6} & \textbf{34.52} \\
+SD 1.5
+& No GTP
+& 0.80 & 1.20 & 66.7 & 29.01
+& 1.10 & 1.40 & 78.6 & 33.80
+& 0.80 & 1.20 & 66.7 & 37.27 \\
+\midrule
+SDXL Base 0.9
+& GTP
+& 0.90 & 1.10 & \textbf{81.8} & \textbf{43.28}
+& 1.10 & 1.30 & \textbf{84.6} & \textbf{48.44}
+& 1.00 & 1.10 & \textbf{90.9} & \textbf{49.67} \\
+SDXL Base 0.9
+& No GTP
+& 1.00 & 1.30 & 76.9 & 43.43
+& 0.90 & 1.10 & 81.8 & 48.81
+& 1.10 & 1.30 & 84.6 & 52.96 \\
+\midrule
+SD 3.5 Medium
+& GTP
+& 1.00 & 1.80 & \textbf{55.6} & \textbf{55.78}
+& 1.00 & 1.60 & \textbf{62.5} & \textbf{61.67}
+& 1.10 & 1.70 & \textbf{64.7} & \textbf{66.03} \\
+SD 3.5 Medium
+& No GTP
+& 0.80 & 1.60 & 50.0 & 62.60
+& 1.10 & 1.80 & 61.1 & 67.69
+& 0.90 & 1.80 & 50.0 & 70.49 \\
+\midrule
+SD 3.5 Large Turbo
+& GTP
+& 1.00 & 1.20 & \textbf{83.3} & \textbf{87.65}
+& 1.00 & 1.20 & 83.3 & \textbf{85.75}
+& 1.10 & 1.20 & \textbf{91.7} & \textbf{88.54} \\
+SD 3.5 Large Turbo
+& No GTP
+& 1.00 & 1.30 & 76.9 & 86.83
+& 1.10 & 1.20 & \textbf{91.7} & 89.20
+& 1.10 & 1.30 & 84.6 & 104.73 \\
+\midrule
+FLUX.1-dev
+& GTP
+& 1.00 & 1.10 & \textbf{90.9} & \textbf{117.5}
+& 1.00 & 1.00 & \textbf{100.0} & \textbf{135.6}
+& 1.10 & 1.20 & \textbf{91.7} & \textbf{145.0} \\
+FLUX.1-dev
+& No GTP
+& 1.00 & 1.20 & 83.3 & 120.3
+& 1.10 & 1.20 & 91.7 & 138.8
+& 1.10 & 1.20 & 91.7 & 148.4 \\
+\bottomrule
+\end{tabular}
+}
+\caption{%
+Compact GuardPaint ablation across evaluated architectures.
+For each correction budget~$c$, we report mean accepted corrections
+per prompt (\textbf{Acc.}), mean tournaments triggered per prompt
+(\textbf{Sug.}), acceptance percentage
+(\textbf{\% Acc.}), and mean wall-clock time per prompt
+(\textbf{Time (s)}), averaged over 10 adversarial prompts.
+Bold indicates the better value per metric within each model--budget pair.
+}
+\label{tab:guardpaint_ablation}
+\end{table*}
+\subsection{Seam Quality Metric}
+\label{app:tspo_seam}
+%% ────────────────────────────────────────────────────────────────────────────
+
+The seam quality score $B_i$ quantifies how well the inpainted candidate
+blends with the surrounding context at the mask boundary.
+A candidate that passes both the policy and faithfulness gates but introduces
+a visible seam would be rejected, $B_i$ encodes this
+rejection criterion numerically.
+
+\paragraph{Computation.}
+Let $\partial m$ denote the ring-shaped boundary region of the mask,
+defined as:
+\begin{equation}
+  \partial m = \mathrm{Dilate}(m, k) - \mathrm{Erode}(m, k) \notag
+\end{equation}
+\begin{equation}
+  \quad k = 2\,r_\text{ring} + 1 = 17, \notag
+  \label{eq:ring_mask}
+\end{equation}
+where $r_\text{ring} = 8$ pixels (at $512 \times 512$).
+This ring isolates the mask boundary where seam artifacts appear.
+
+The seam score is computed via LPIPS~\cite{Zhang_2018_CVPR} restricted to
+the ring region:
+\begin{equation}
+\begin{aligned}
+  B_i = \exp\!\Big(-\kappa \cdot \frac{\sum_{p \in \partial m}
+    \mathrm{LPIPS}_p(C_i, C_0)}
+    {|\partial m|}\Big), \\
+  \quad \kappa = 5.0, \notag
+  \label{eq:seam_score}
+\end{aligned}
+\end{equation}
+where $C_0$ is the control (unedited) image and $\partial m$ is the ring
+mask at the appropriate spatial resolution.
+$B_i = 1.0$ indicates a seamless edit (zero LPIPS difference at the
+boundary); $B_i \to 0$ indicates a severe seam artifact.
+
+% \paragraph{Multi-scale VGG fallback.}
+% When the \texttt{lpips} library is unavailable, a multi-scale VGG-16
+% perceptual distance is computed instead:
+% \begin{equation}
+%   d_\text{VGG} = \frac{1}{|\mathcal{S}|}
+%     \sum_{s \in \mathcal{S}}
+%     \frac{\sum_{p \in \partial m}
+%       \|\phi_s(C_i)_p - \phi_s(C_0)_p\|_2^2}
+%     {|\partial m|},
+%   \label{eq:vgg_distance}
+% \end{equation}
+% where $\mathcal{S} = \{\text{conv1\_2, conv2\_2, conv3\_3, conv4\_3,
+% conv5\_3}\}$ are the five VGG-16 activation slices at increasing
+% receptive fields.
+% Each slice uses a $1\times 1$ convolution with uniform weights to produce
+% a scalar distance per spatial location.
+% $B_i = \exp(-\kappa \cdot d_\text{VGG})$ with the same $\kappa = 5.0$.
+
+\paragraph{Why exponential?}
+The exponential mapping ensures $B_i \in (0, 1]$ with a smooth decay:
+small LPIPS differences at the boundary (good blending) produce $B_i
+\approx 1$; a mean LPIPS of $0.2$ (perceptible difference) produces
+$B_i = e^{-1.0} \approx 0.37$, substantially downweighting such
+candidates in the utility computation.
+\iffalse
+%% ────────────────────────────────────────────────────────────────────────────
+\subsection{Listwise Judge Refiner: Co-Training the Auditor}
+\label{app:tspo_judge}
+%% ────────────────────────────────────────────────────────────────────────────
+
+\texttt{ListwiseJudgeRefiner}~ co-trains a subset of the auditor's parameters alongside the Gaurded Tournament Policy.
+The motivation is that the auditor's scoring function (\texttt{policy\_safe})
+must track the policy's distribution of proposals: if the auditor's
+scores are poorly calibrated relative to actual utility ordering, the
+GTP loss receives noisy advantage weights and policy learning is
+impeded.
+
+\paragraph{Which parameters are trained?}
+The judge refiner trains only the auditor's \emph{cross-attention and
+projection heads}:
+\begin{itemize}[leftmargin=1.5em,itemsep=1pt,topsep=2pt]
+  \item \texttt{img\_proj\_head} (image $\to$ 256-dim embedding)
+  \item \texttt{txt\_proj\_head} (text $\to$ 256-dim embedding)
+  \item \texttt{cross\_attention} (multi-head attention)
+  \item \texttt{query\_norm}, \texttt{key\_norm} (pre-attention LayerNorms)
+\end{itemize}
+The ResNet-101 backbone and all other auditor heads are kept frozen.
+This fine-tunes only the relative ranking signal (\texttt{policy\_safe})
+without disturbing the classification, heatmap, or faithfulness heads that
+were trained on the 82K dataset.
+
+\paragraph{Listwise ranking loss.}
+Given a tournament of $N$ candidates with utilities $u_1, \ldots, u_N$
+and auditor \texttt{policy\_safe} scores $s_1, \ldots, s_N$, the judge
+refiner minimises a combination of ListNet~\cite{cao2007listnet} and
+Plackett-Luce top-1 losses:
+\begin{align}
+  \mathcal{L}_\text{LN} &= -\sum_{i=1}^N
+    q_i \log p_i, 
+    \notag
+    \label{eq:listnet}
+    \end{align}
+\begin{align}
+  \mathcal{L}_\text{PL} &= \text{CrossEntropy}\!\left(
+    \mathbf{s},\; [i^*]\right),
+    \notag
+    \label{eq:pl_top1}
+\end{align}
+where:
+\begin{align*}
+  q_i &= \frac{\exp(u_i / \tau_\text{target})}{\sum_j \exp(u_j / \tau_\text{target})},
+    \quad \tau_\text{target} = 0.5, \\
+  p_i &= \frac{\exp(s_i / \tau_\text{model})}{\sum_j \exp(s_j / \tau_\text{model})},
+    \quad \tau_\text{model} = 1.0, \\
+  i^* &= \arg\max_i u_i. 
+\end{align*}
+
+The ListNet loss minimises the cross-entropy between the utility-induced
+ranking distribution (target) and the score-induced ranking distribution
+(model), which is equivalent to minimising the KL divergence up to an
+additive constant independent of the model parameters.
+The top-1 Plackett-Luce approximation is implemented as a cross-entropy
+loss that focuses specifically on whether the auditor assigns the highest
+score to the winning candidate.
+
+The combined loss is:
+\begin{equation}
+\begin{aligned}
+  \mathcal{L}_\text{judge} = \lambda_\text{LN} \mathcal{L}_\text{LN}
+    + \lambda_\text{PL} \mathcal{L}_\text{PL},
+  \quad
+  \\
+  \lambda_\text{LN} = 1.0, \;
+  \lambda_\text{PL} = 0.5. \notag
+  \end{aligned}
+\end{equation}
+
+The lower temperature for the target distribution ($\tau_\text{target} = 0.5$)
+produces a sharper target (more concentrated on the winner), while the
+higher model temperature ($\tau_\text{model} = 1.0$) produces a softer
+model distribution.
+This asymmetry mirrors knowledge distillation practice: the teacher
+(utility-derived ranking) is confident while the student (auditor scores)
+is encouraged to be more uncertain, preventing excessively overconfident score calibration that would otherwise bias the auditor toward winner-prediction-only behavior.
+
+\paragraph{Update frequency.}
+The judge refiner accumulates tournament records in a buffer and triggers
+a weight update when 8 records are available (the same mini-batch size as Guarded tournament policy).
+Both the policy and the judge are updated from the same set of rollouts,
+ensuring that the scoring function adapts at the same rate as the policy.
+\subsection{Latent Reinsertion: Strategy Comparison and Selection}
+\label{app:reinsertion_strategies}
+%% ────────────────────────────────────────────────────────────────────────────
+ \fi
+After the guarded tournament selects a winning inpainted candidate
+$C_{i^*}$ in pixel space, the repair must be reintroduced into the live
+diffusion trajectory $\{z_t\}$ without disrupting the denoising manifold.
+Naive injection, encoding $C_{i^*}$ with the base VAE and substituting the resulting latent directly into $z_t$ consistently produces visible boundary seams and color drift in downstream denoising steps, because the re-encoded latent does not lie on the trajectory the base UNet expects.
+
+We therefore designed and evaluated four reinsertion strategies, formalized below, before selecting the production method.
+All four share the same preparatory step: $C_{i^*}$ is resized to the pixel resolution implied by $z_t$'s spatial dimensions, encoded with the \emph{base} model's VAE (not the inpainter's VAE) to obtain $\hat{z}_0^{\mathrm{edit}} \in \mathbb{R}^{C \times H' \times W'}$, and a binary mask $m \in \{0,1\}^{H' \times W'}$ is resized to latent resolution. The output of each strategy is the updated latent $z_t^{\mathrm{new}}$ passed to the next UNet step.
+
+\paragraph{1. DDPM noise blending}
+This approach degrades the clean edited latent to the current timestep's noise level via the standard forward diffusion process \citep{ho2020denoising} before spatial masking:
+\begin{align*}
+  \hat{z}_t^{\mathrm{edit}}
+  &= \sqrt{\bar{\alpha}_t}\,\hat{z}_0^{\mathrm{edit}}
+   + \sqrt{1-\bar{\alpha}_t}\,\boldsymbol{\varepsilon},
+   \quad \boldsymbol{\varepsilon} \sim \mathcal{N}(\mathbf{0},\mathbf{I}), \\
+  z_t^{\mathrm{new}}
+  &= (1-m)\odot z_t^{\mathrm{ctrl}}
+   + m\odot \hat{z}_t^{\mathrm{edit}}.
+\end{align*}
+\textbf{Failure:} Inside the masked region, $\hat{z}_t^{\mathrm{edit}}$ contains freshly sampled, independent noise $\boldsymbol{\varepsilon}$. Outside the mask, $z_t^{\mathrm{ctrl}}$ contains the specific historical noise sequence accumulated during the generation process. This statistical independence creates a sharp discontinuity at the boundary. The UNet interprets this boundary as a structural edge, generating persistent incorrect artifacts in subsequent denoising steps.
+
+\paragraph{2. Direct latent blending}
+Rather than matching noise levels, this method directly interpolates the clean edit into the noisy control latent using a time-decaying weight $\alpha$ \citep{avrahami2022blended}:
+\begin{align*}
+  z_t^{\mathrm{new}} &= \bigl(1 - \alpha \cdot m\bigr)\odot z_t^{\mathrm{ctrl}} + \alpha \cdot m \odot \hat{z}_0^{\mathrm{edit}}, \\
+  &\quad \text{where } \alpha = 1 - t_{\mathrm{norm}}.
+\end{align*}
+\textbf{Failure:} Because $\hat{z}_0^{\mathrm{edit}}$ represents a fully denoised state ($t{=}0$) and $z_t^{\mathrm{ctrl}}$ is noisy, their linear combination falls outside the expected distribution of the diffusion process. Consequently, the UNet under-denoises the injected region, yielding flat, over-saturated patches. This degradation is most severe at earlier generation stages (lower $t_{\mathrm{norm}}$), which is precisely when \guardpaint{} interventions are most critical.
+
+\paragraph{3. DDIM inversion}
+This strategy attempts to find a compatible noise state by inverting $\hat{z}_0^{\mathrm{edit}}$ forward to timestep $t$ using $d{=}10$ deterministic DDIM steps \citep{song2020denoising} prior to blending:
+\begin{align*}
+  \hat{z}_t^{\mathrm{inv}} &= \mathrm{DDIMInv}\!\bigl(\hat{z}_0^{\mathrm{edit}},\,t,\,d\bigr), \\
+  z_t^{\mathrm{new}} &= (1-\alpha\cdot m)\odot z_t^{\mathrm{ctrl}} + \alpha\cdot m \odot \hat{z}_t^{\mathrm{inv}}, \\
+  &\quad \text{where } \alpha = 1-t_{\mathrm{norm}}.
+\end{align*}
+\textbf{Failure:} DDIM inversion under classifier-free guidance introduces reconstruction errors that scale inversely with $d$ \citep{mokady2023null}. More problematically, the inversion is conditioned on the original adversarial text prompt $c_{\mathrm{text}}$. This conditioning pulls the latent back toward the unsafe concept, actively fighting the safety correction achieved by the tournament. Adjusting $d$ offers no viable compromise: small values produce severe boundary seams, while larger values drastically increase latency without matching the quality of null-text methods.
+
+\paragraph{4. Null-text inversion (selected method).}
+We adapt null-text inversion \citep{mokady2023null} to function mid-trajectory. Rather than altering the latents directly, we freeze the UNet $f_\theta$ and the text conditioning $c_{\mathrm{text}}$, and optimize a learnable unconditional embedding $\boldsymbol{\emptyset}^*$. The objective forces the UNet's single-step prediction to align perfectly with the clean edit:
+\begin{equation*}
+  \boldsymbol{\emptyset}^{*} = \arg\min_{\boldsymbol{\emptyset}} \Bigl\| \hat{z}_0\!\bigl(\hat{z}_0^{\mathrm{edit}},\,t,\,\boldsymbol{\emptyset},\,c_{\mathrm{text}}\bigr) - \hat{z}_0^{\mathrm{edit}} \Bigr\|_2^2
+\end{equation*}
+where $\hat{z}_0(\cdot)$ denotes the UNet's predicted clean latent under CFG \citep{ho2022classifier}. This objective is minimized for 10 AdamW steps ($\mathrm{lr}{=}0.01$). The latent is then updated via feathered mask blending:
+\begin{align*}
+  z_t^{\mathrm{new}} &= \bigl(1-\alpha \cdot m\bigr)\odot z_t^{\mathrm{ctrl}} + \alpha \cdot m \odot \hat{z}_0^{\mathrm{edit}}, \\ \qquad
+  &\quad \text{where } \alpha = 1-t_{\mathrm{norm}}.
+\end{align*}
+
+\textbf{Why null-text inversion succeeds.}
+ UNet's prediction becomes self-consistent as a single denoising step from the blended latent reproduces $\hat{z}_0^{\mathrm{edit}}$ inside the mask and preserves the control trajectory outside it. This resolves the independent noise discontinuities of DDPM blending, the state mismatch of direct blending, and the adversarial concept leakage of DDIM inversion. Furthermore, the brief 10-step optimization overhead is incurred only once per audited timestep and is amortized efficiently across all candidates via a per-timestep embedding cache.
+
+\textbf{Flow-matching architectures.}
+For flow-matching models (e.g., SD\,3.5 and FLUX.1-dev) where the DDPM forward process does not apply, the noise-matched latent is approximated as $(1-\sigma_t)\hat{z}_0^{\mathrm{edit}} + \sigma_t\boldsymbol{\varepsilon}$ \citep{liu2023flow}, where $\sigma_t$ represents the schedule flow sigma. Adapting native null-text inversion to flow-matching paradigms remains an area for future work.
+
+\clearpage
+\newpage
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\linewidth]{reinsert-quality.png}
+  \caption{
+    \textbf{Shows the qualitative difference between different
+    reinsertion strategies tried for Stable Diffusion~1.5 and
+    SDXL~0.9 Base.}
+  }
+  \label{fig:rein}
+\end{figure*}
+
+
+%% ────────────────────────────────────────────────────────────────────────────
+\subsection{Full Training Configuration}
+\label{app:tspo_config}
+%% ────────────────────────────────────────────────────────────────────────────
+
+\begin{table}[h]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lll}
+\toprule
+\textbf{Parameter} & \textbf{Value} & \textbf{Notes} \\
+\midrule
+\multicolumn{3}{l}{\textit{Policy network}} \\
+State dim $d_s$   & 257 & $4 \times 64 + 1$ \\
+Projection dim    & 64  & Per input \\
+Hidden dims       & $(256, 128, 64)$ & LayerNorm + SiLU \\
+Log-std clamp     & $[-4.0, +0.5]$ & \\
+Weight init       & Orthogonal, gain $0.01$ & \\
+\midrule
+\multicolumn{3}{l}{\textit{Tournament}} \\
+Candidates $N$    & 5   & \\
+Audit start       & 70\% of schedule & \\
+Audit resolution  & 224 px ($t < 0.65$), 384 px ($t \geq 0.65$) & Coarse/fine \\
+$\delta$ init     & 0.05 & Recalibrated every 100 steps \\
+$\delta$ min samples & 50 & Before first recalibration \\
+\midrule
+\multicolumn{3}{l}{\textit{GTP loss}} \\
+$\lambda_H^\text{cont}$ & 0.01 & Continuous entropy \\
+$\lambda_H^\text{disc}$ & 0.005 & Discrete entropy \\
+$\lambda_c$             & 0.005 & Compute penalty \\
+$\lambda_\text{div}$    & 0.01 & Diversity \\
+$\lambda_\text{listnet}$& 1.0  & ListNet weight in judge \\
+$\lambda_\text{PL}$     & 0.5  & Plackett-Luce weight in judge \\
+\midrule
+\multicolumn{3}{l}{\textit{Optimization}} \\
+Policy optimizer  & AdamW, lr $3\!\times\!10^{-4}$ & \\
+Judge optimizer   & AdamW, lr $1\!\times\!10^{-4}$ & \\
+Mini-batch size   & 4 tournaments (policy), 8 (judge) & \\
+Gradient clipping & 1.0 & Both policy and judge \\
+Total steps       & 1000 (convergence $\approx$400--600) & \\
+\midrule
+\multicolumn{3}{l}{\textit{Seam quality}} \\
+Ring width        & 8 px & \\
+LPIPS net         & VGG (spatial), $\kappa=5.0$ & \\
+\midrule
+\multicolumn{3}{l}{\textit{Time-varying thresholds}} \\
+$\tau_P(t)$       & $0.40 + 0.25\,t$ & \\
+$\tau_F(t)$       &$
+\tau_F(t_{\text{norm}})=
+\begin{cases}
+0.30 + 0.30\, t_{\text{norm}}, \\
+\quad t_{\text{norm}} < 0.85, \\[8pt]
+0.55 - 0.10\,
+\left(
+\frac{t_{\text{norm}} - 0.85}{0.15}
+\right), \\
+\quad t_{\text{norm}} \geq 0.85.\notag
+\end{cases}
+$                 & Non-monotone \\
+$\alpha(t)$       & $0.30 + 0.60\,t$ & Blend coefficient \\
+\bottomrule
+\end{tabular}
+\caption{
+  Complete Guarded Tournament Policy training and inference configuration.
+}
+\label{tab:tspo_config}
+\end{table}
+
