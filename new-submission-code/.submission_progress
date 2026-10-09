@@ -1,0 +1,15 @@
+baseline::sld::SD 1.5
+baseline::sld::SDXL
+baseline::sld::Flux.1
+baseline::post_hoc::SD 1.5
+baseline::post_hoc::SDXL
+baseline::post_hoc::Flux.1
+baseline::esd::SD 1.5
+baseline::esd::SDXL
+baseline::esd::Flux.1
+baseline::safegen::SD 1.5
+baseline::safegen::SDXL
+baseline::safegen::Flux.1
+baseline::latent_guard::SD 1.5
+baseline::latent_guard::SDXL
+baseline::latent_guard::Flux.1
